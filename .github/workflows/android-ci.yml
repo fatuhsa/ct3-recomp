@@ -85,12 +85,28 @@ jobs:
           add_executable(xbe_recomp ${RECOMP_SRCS})
           target_include_directories(xbe_recomp PRIVATE "${SDK_DIR}/runtime" "${SDK_DIR}/tools/recomp")
           target_link_libraries(xbe_recomp PRIVATE Zydis tomlplusplus::tomlplusplus)
+
+          add_executable(xbe_symbols "${SDK_DIR}/tools/symbols/main.cpp")
+          target_include_directories(xbe_symbols PRIVATE "${SDK_DIR}/runtime")
+          target_link_libraries(xbe_symbols PRIVATE Zydis tomlplusplus::tomlplusplus)
           EOF
 
           cmake -S "${RUNNER_TEMP}/recomp_src" -B "${RUNNER_TEMP}/recomp_build" -G Ninja \
             -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release \
             -DSDK_DIR="${PWD}/sdk"
-          cmake --build "${RUNNER_TEMP}/recomp_build" --target xbe_recomp -j"$(nproc)"
+          cmake --build "${RUNNER_TEMP}/recomp_build" --target xbe_recomp xbe_symbols -j"$(nproc)"
+
+          # Run xbe_symbols using XDK 4831 signatures as a cross-XDK seed for XDK 4531 discovery
+          mkdir -p "${RUNNER_TEMP}/xdk_scan/4531"
+          cp config/xdk/4531/layout.toml "${RUNNER_TEMP}/xdk_scan/4531/layout.toml"
+          cp sdk/xdk/4831/signatures.toml "${RUNNER_TEMP}/xdk_scan/4531/signatures.toml"
+          mkdir -p generated/symbols
+          "${RUNNER_TEMP}/recomp_build/xbe_symbols" assets/default.xbe "${RUNNER_TEMP}/xdk_scan" \
+            --library CrazyTaxi3.dll --out generated/symbols/ct3_4531_scan.toml || true
+          if [[ -f generated/symbols/ct3_4531_scan.toml ]]; then
+            RESOLVED="$(grep -E '^[A-Za-z_][A-Za-z0-9_]* *= *0x[0-9A-Fa-f]+' generated/symbols/ct3_4531_scan.toml | wc -l)"
+            echo "xbe_symbols auto-resolved ${RESOLVED} XDK 4531 candidate symbols/data entries!"
+          fi
 
           "${RUNNER_TEMP}/recomp_build/xbe_recomp" \
             config/game.toml assets/default.xbe generated/game --xdk config/xdk
@@ -99,6 +115,14 @@ jobs:
           echo "Successfully lifted ${PART_COUNT} C++ partitions + x86_func_mapping.cpp"
           ls -lh generated/game/x86_func_mapping.cpp
           test "$PART_COUNT" -eq 128
+
+      - name: Upload XDK 4531 xbe_symbols scan report
+        uses: actions/upload-artifact@v7
+        with:
+          name: ct3-xdk4531-symbols-scan
+          path: generated/symbols/ct3_4531_scan.toml
+          if-no-files-found: warn
+          retention-days: 14
 
   build-android-arm64:
     name: Build Android ARM64 APK & Verify 16 KB Alignment

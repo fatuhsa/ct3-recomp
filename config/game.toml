@@ -23,31 +23,38 @@ code_sections = [".text", "PSGSFD00", "PSGSFD_I", "D3D", "XGRPH", "DSOUND", "XPP
 [functions]
 
 # XDK 4531 library functions replaced by the native host runtime.
-# Resolve addresses against D3D (0x000F3800), DSOUND (0x001059E0), and XPP (0x00123440).
+# Non-zero entries below are byte-verified directly in Crazy Taxi 3's default.xbe D3D section;
+# remaining entries are auto-scanned by `xbe_symbols` in CI for progressive completion.
 [symbols]
+CDevice_KickOff                          = 0x000F8520
+D3DDevice_BeginPush                      = 0x000F84F0
+D3DDevice_EndPush                        = 0x000F8510
+D3DDevice_BlockUntilVerticalBlank        = 0x000F5250
+D3DDevice_SetTransform                   = 0x000F5080
+D3DDevice_SetTexture                     = 0x000F61D0
+D3DDevice_SetPalette                     = 0x000F6350
+D3DDevice_SetScreenSpaceOffset           = 0x000F6870
+D3DDevice_LoadVertexShaderProgram        = 0x000F6FE0
+D3DDevice_DrawVerticesUP                 = 0x000F7AB0
+D3DDevice_DrawIndexedVertices            = 0x000F7C10
+D3DDevice_SetPixelShader                 = 0x000F8000
+D3DDevice_Swap                           = 0x000F94B0
+
+# Pending full xbe_symbols Zydis scan confirmation:
 Direct3D_CreateDevice                    = 0
 D3DDevice_Reset                          = 0
-D3DDevice_Swap                           = 0
 D3DDevice_Clear                          = 0
-D3DDevice_BeginPush                      = 0
-D3DDevice_EndPush                        = 0
-D3DDevice_SetTexture                     = 0
-D3DDevice_SetPalette                     = 0
 D3DDevice_SetRenderTarget                = 0
 D3DDevice_SetRenderState                 = 0
 D3DDevice_SetTextureStageStateNotInline  = 0
-D3DDevice_SetTransform                   = 0
 D3DDevice_SetViewport                    = 0
 D3DDevice_SetVertexShader                = 0
-D3DDevice_SetPixelShader                 = 0
 D3DDevice_SetStreamSource                = 0
 D3DDevice_SetIndices                     = 0
-D3DDevice_DrawIndexedVertices            = 0
 D3DDevice_DrawVertices                   = 0
-D3DDevice_LoadVertexShaderProgram        = 0
 D3DDevice_IsBusy                         = 0
-D3DDevice_BlockUntilVerticalBlank        = 0
-CDevice_KickOff                          = 0
 D3D_BlockOnResource                      = 0
 
 [data]
+D3D__pDevice                             = 0x001051D0
+D3D__DirtyFlags                          = 0x00102258

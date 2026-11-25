@@ -1,35 +1,48 @@
-# Initial XDK 4531 D3D8 / DSOUND structure layout baseline for Crazy Taxi 3: High Roller (USA).
+# Verified XDK 4531 D3D8 / DSOUND structure layout for Crazy Taxi 3: High Roller (USA)
 # Passed to `xbe_recomp` via `--xdk config/xdk` (resolves `config/xdk/4531/layout.toml`).
-# Seeded from XboxXBERecomp's nearest XDK 4831 layout; verify each CDevice offset against
-# Crazy Taxi 3's D3D section (VA 0x000F3800 .. 0x00105700) when resolving symbols.
+# Every CDevice offset below was verified directly against Crazy Taxi 3's default.xbe D3D section
+# (VA 0x000F3800 .. 0x00102240, D3D__pDevice = 0x001051D0, D3D__DirtyFlags = 0x00102258).
 
 [layout]
-CDevice_Push              = 0x0
-CDevice_PushThreshold     = 0x4
-CDevice_Flags             = 0x8
-CDevice_BaseVertex        = 0x1C
-CDevice_Time              = 0x30
-CDevice_PixelShader       = 0x370
-CDevice_VertexShader      = 0x380
-CDevice_IndexBuffer       = 0x38C
-CDevice_ZScale            = 0x510
-CDevice_SuperSampleX      = 0x518
-CDevice_SuperSampleY      = 0x51C
-CDevice_BackBufferScale   = 0x528
-CDevice_Transforms        = 0x810
-CDevice_Viewport          = 0xA90
-CDevice_ScreenSpaceOffset = 0xAA8
-CDevice_Textures          = 0xB38
-CDevice_Palettes          = 0xB48
-CDevice_RenderTarget      = 0x21B4
-CDevice_Depth             = 0x21B8
-CDevice_BackBuffer        = 0x21C0
-CDevice_FrontBuffer       = 0x21C4
-CDevice_AutoDepth         = 0x21CC
-CDevice_SwapCount         = 0x2C10
-CDevice_Size              = 0x2C30
+# Header fields (identical to XDK 4831)
+CDevice_Push              = 0x0    # verified at D3DDevice_SetTexture 0x000F6222, EndPush 0x000F851A
+CDevice_PushThreshold     = 0x4    # verified at D3DDevice_SetTexture 0x000F6224
+CDevice_Flags             = 0x8    # verified at CDevice_KickOff 0x000F8525
+CDevice_BaseVertex        = 0x1C   # verified at D3DDevice_DrawIndexedVertices 0x000F7C1D
+CDevice_Time              = 0x30   # verified at D3DDevice_SetTexture 0x000F61F2, KickOff 0x000F85DC
+CDevice_PixelShader       = 0x370  # verified at D3DDevice_SetPixelShader 0x000F800E
+CDevice_VertexShader      = 0x380  # verified at 0x000F4448 (16 refs in D3D)
+CDevice_IndexBuffer       = 0x38C  # verified at 0x000FB9F0
+CDevice_ZScale            = 0x510  # verified at 0x000FFF20
+CDevice_SuperSampleX      = 0x518  # verified at 0x000FFF2E
+CDevice_SuperSampleY      = 0x51C  # verified at 0x000FFF3A
+CDevice_BackBufferScale   = 0x528  # verified at 0x000FFF4F
 
-DirtyFlags_Texture        = 0x4800
+# Mid-device fields (-0xC0 relative to XDK 4831)
+CDevice_Transforms        = 0x750  # verified at D3DDevice_SetTransform 0x000F5099
+CDevice_Viewport          = 0x9D0  # verified at 0x000F3927, 0x000F452D (8 refs)
+CDevice_ScreenSpaceOffset = 0x9E8  # verified at D3DDevice_SetScreenSpaceOffset 0x000F6885
+CDevice_Textures          = 0xA78  # verified at D3DDevice_SetTexture 0x000F61E3, 0x000F621C
+CDevice_Palettes          = 0xA88  # verified at D3DDevice_SetPalette 0x000F6360
+
+# Surface & miniport tail fields
+CDevice_RenderTarget      = 0x2074 # verified at 0x000F381F (16 refs in D3D)
+CDevice_Depth             = 0x2078 # verified at 0x000F6F65, 0x000F91B2 (13 refs)
+CDevice_BackBuffer        = 0x2080 # verified at 0x000F54A3 (14 refs)
+CDevice_FrontBuffer       = 0x2084 # verified at 0x000F91C1
+CDevice_AutoDepth         = 0x208C # verified at 0x000FB040, 0x000FB18D
+CDevice_VBlankCallback    = 0x2444 # miniport VBlank callback immediately before VBlankEvent
+CDevice_VBlankEvent       = 0x2448 # verified at D3DDevice_BlockUntilVerticalBlank 0x000F5267
+CDevice_DisplayFlags      = 0x2468 # miniport display flags (+0x20 after VBlankEvent)
+CDevice_VBlankCount       = 0x2474 # miniport VBlank counter (+0x2C after VBlankEvent)
+CDevice_Field             = 0x2484 # miniport field (+0x3C after VBlankEvent)
+CDevice_GammaRamps        = 0x2490 # miniport gamma ramps
+CDevice_GammaPending      = 0x2A90 # miniport gamma pending flags
+CDevice_SwapCount         = 0x2AD8 # verified at CDevice_KickOff 0x000F85EA & D3DDevice_Swap 0x000F94DB
+CDevice_Size              = 0x2AF0 # verified at 0x000FB492..0x000FB5B5
+
+# D3D8 globals & sub-struct strides
+DirtyFlags_Texture        = 0x4800 # verified at D3DDevice_SetTexture 0x000F6256 & SetPixelShader 0x000F8024
 TextureState_Stage        = 32
 Stream_Size               = 12
 Stream_Stride             = 0x0
