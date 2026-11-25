@@ -584,6 +584,15 @@ void VulkanRenderer::Resize(uint32_t width, uint32_t height, uint32_t scale_pct)
     log::Info("CT2Vk", "Resize surface=%ux%u scale=%u%%", width, height, scale_pct);
 }
 
+void VulkanRenderer::SetGameClearColor(uint32_t argb) {
+    game_clear_argb_.store(argb, std::memory_order_release);
+    has_game_clear_.store(true, std::memory_order_release);
+}
+
+void VulkanRenderer::PresentNow() {
+    ExecutePresent();
+}
+
 void VulkanRenderer::StartPoolResetWorker() {
     if (reset_running_.exchange(true)) return;
     reset_worker_ = std::thread([this] {
@@ -1083,13 +1092,23 @@ void VulkanRenderer::ExecutePresent() {
                                         frame.query_pool, 0);
                 }
 
-                // Live Crazy Taxi diagnostic pulse (Taxi Yellow <-> Deep Navy) until lifted game draws
-                const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(present_count_) * 0.04f);
+                // Use Crazy Taxi 3's live D3DDevice_Clear color once lifted XBE draws;
+                // otherwise show Crazy Taxi Yellow <-> Deep Navy Vulkan swapchain pulse.
                 VkClearValue clear_val{};
-                clear_val.color.float32[0] = 0.08f + 0.85f * pulse;
-                clear_val.color.float32[1] = 0.12f + 0.62f * pulse;
-                clear_val.color.float32[2] = 0.22f - 0.14f * pulse;
-                clear_val.color.float32[3] = 1.0f;
+                if (has_game_clear_.load(std::memory_order_acquire)) {
+                    const uint32_t c = game_clear_argb_.load(std::memory_order_acquire);
+                    clear_val.color.float32[0] = ((c >> 16) & 0xFFu) / 255.0f;
+                    clear_val.color.float32[1] = ((c >> 8) & 0xFFu) / 255.0f;
+                    clear_val.color.float32[2] = (c & 0xFFu) / 255.0f;
+                    clear_val.color.float32[3] = 1.0f;
+                } else {
+                    const float pulse =
+                        0.5f + 0.5f * std::sin(static_cast<float>(present_count_) * 0.04f);
+                    clear_val.color.float32[0] = 0.08f + 0.85f * pulse;
+                    clear_val.color.float32[1] = 0.12f + 0.62f * pulse;
+                    clear_val.color.float32[2] = 0.22f - 0.14f * pulse;
+                    clear_val.color.float32[3] = 1.0f;
+                }
 
                 VkRenderPassBeginInfo rpbi{};
                 rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;

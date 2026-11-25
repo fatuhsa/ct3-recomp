@@ -24,10 +24,14 @@ android {
 
         externalNativeBuild {
             cmake {
+                val hasSdkAndLifted =
+                    file("../../sdk/runtime").exists() &&
+                        file("../../generated/game/x86_func_mapping.cpp").exists()
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
                     "-DANDROID_PLATFORM=android-29",
-                    "-DCT2_ENABLE_PRELOAD=ON"
+                    "-DCT2_ENABLE_PRELOAD=ON",
+                    "-DCT3_ENABLE_XBE_SDK=${if (hasSdkAndLifted) "ON" else "OFF"}"
                 )
             }
         }

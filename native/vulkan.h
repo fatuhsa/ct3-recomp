@@ -115,6 +115,8 @@ public:
     void SetNativeWindow(void* native_window, uint32_t width, uint32_t height);
     void Resize(uint32_t width, uint32_t height, uint32_t scale_pct);
     void ReplayBatch(const gfx::CmdBatch& batch, const uint8_t* header_ring);
+    void SetGameClearColor(uint32_t argb);
+    void PresentNow();
 
     // Sampled guest surface hashing (<=64 KB whole, >64 KB 64x64B evenly spaced slices).
     static uint64_t MemSig(uint32_t guest_va, uint32_t total_bytes);
@@ -228,6 +230,8 @@ private:
     bool initialized_ = false;
     bool swapchain_ready_ = false;
     bool swapchain_dirty_ = false;
+    std::atomic<bool> has_game_clear_{false};
+    std::atomic<uint32_t> game_clear_argb_{0};
     uint32_t swap_width_ = 0;
     uint32_t swap_height_ = 0;
     uint32_t swap_image_count_ = 0;

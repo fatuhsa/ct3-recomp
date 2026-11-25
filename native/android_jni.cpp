@@ -8,13 +8,21 @@
 #include "host/save_guard.h"
 #include "host/xbe_loader.h"
 #include "kernel/xbox_kernel.h"
+#include "native/ct3_sdk_bridge.h"
 #include "native/dynamic_resolution.h"
 #include "native/stats.h"
 #include "native/vulkan.h"
 #include "recomp/x86_context.h"
 
+#ifdef CT3_ENABLE_XBE_SDK
+#include "core/log.h"
+#include "kernel/disc.h"
+#include "kernel/kernel.h"
+#endif
+
 #include <atomic>
 #include <cstdio>
+#include <filesystem>
 #include <jni.h>
 #include <memory>
 #include <mutex>
@@ -42,6 +50,9 @@ struct RuntimeState {
     std::string files_dir;
     std::string cache_dir;
     std::string rom_dir;
+    std::string rom_open_path;
+    int rom_saf_fd = -1;
+    std::string boot_status = "Waiting for ROM";
 
     std::atomic<bool> running{false};
     std::atomic<bool> paused{false};
@@ -74,14 +85,65 @@ std::string JStringToStd(JNIEnv* env, jstring js) {
 bool BootLoadedRomLocked() {
     if (!g_rt.rom.LoadDefaultXbe(g_rt.xbe_info)) {
         ct2::log::Error("CT3Jni", "Mounted ROM does not contain a valid Original Xbox default.xbe");
+        g_rt.boot_status = "Invalid XBE";
         return false;
     }
     g_rt.kernel.Initialize(&g_rt.rom, g_rt.xbe_info);
     g_rt.cpu_ctx.eip = g_rt.xbe_info.entry_point;
 
+#ifdef CT3_ENABLE_XBE_SDK
+    // Boot real statically recompiled 128-partition Crazy Taxi 3 XBE via portable XboxXBERecomp SDK!
+    if (!ct2::sdk_bridge::Metrics().booted.exchange(true)) {
+        std::error_code ec;
+        const std::string log_dir = g_rt.files_dir + "/logs";
+        std::filesystem::create_directories(log_dir, ec);
+        logx::Init(log_dir, "ct3", false);
+
+        std::vector<uint8_t> xbe_bytes;
+        if (!g_rt.rom.ReadXboxFile("default.xbe", xbe_bytes)) {
+            g_rt.boot_status = "Failed reading default.xbe";
+            ct2::sdk_bridge::Metrics().booted.store(false);
+            return false;
+        }
+
+        // Mount XISO into XboxXBERecomp kernel::Disc (direct path or /proc/self/fd/<fd>)
+        std::string disc_path = g_rt.rom_open_path;
+        if (disc_path.empty() && g_rt.rom_saf_fd >= 0) {
+            disc_path = "/proc/self/fd/" + std::to_string(g_rt.rom_saf_fd);
+        }
+        if (!disc_path.empty()) {
+            auto disc = std::make_unique<::kernel::Disc>();
+            std::string err;
+            if (disc->Open(disc_path, err)) {
+                ::kernel::MountDisc(std::move(disc));
+                ct2::log::Info("CT3Boot", "Mounted kernel::Disc from %s", disc_path.c_str());
+            } else {
+                ct2::log::Warn("CT3Boot", "kernel::Disc::Open(%s) failed: %s",
+                               disc_path.c_str(), err.c_str());
+            }
+        }
+
+        const std::string game_dir = g_rt.rom_dir.empty() ? g_rt.files_dir : g_rt.rom_dir;
+        const std::string data_dir = g_rt.files_dir + "/xbox_hdd";
+        std::filesystem::create_directories(data_dir, ec);
+
+        if (::kernel::Boot(std::move(xbe_bytes), "default.xbe", game_dir, data_dir)) {
+            g_rt.boot_status = "LIVE (128 lifted XBE partitions running)";
+            ct2::log::Info("CT3Boot", "XboxXBERecomp kernel::Boot started Crazy Taxi 3 entry 0x%08X!",
+                           g_rt.xbe_info.entry_point);
+        } else {
+            g_rt.boot_status = "kernel::Boot failed (check files/logs/ct3.log)";
+            ct2::log::Error("CT3Boot", "XboxXBERecomp kernel::Boot failed!");
+            return false;
+        }
+    }
+#else
+    g_rt.boot_status = "Diag Mode (SDK disabled)";
+#endif
+
     if (g_rt.running.exchange(true)) return true;
     g_rt.title_thread = std::thread([] {
-        g_rt.watchdog.RegisterThread("TitleThread", pthread_self(), &g_rt.cpu_ctx.eip);
+        g_rt.watchdog.RegisterThread("HostPacer", pthread_self(), &g_rt.cpu_ctx.eip);
         uint64_t frame_index = 0;
 
         while (g_rt.running.load(std::memory_order_acquire)) {
@@ -91,23 +153,16 @@ bool BootLoadedRomLocked() {
             }
 
             const auto t0 = std::chrono::steady_clock::now();
-            ct2::recomp::StepGuestFrame(g_rt.cpu_ctx, frame_index++);
-
-            const bool skip_draw = g_rt.game_loop.TickFrameSkip();
-            if (!skip_draw && g_rt.d3d) {
-                g_rt.d3d->Clear(0xFF000000u);
-                g_rt.d3d->Swap();
-                g_rt.watchdog.NotifyPresent();
-
-                uint32_t new_scale = 100;
-                if (g_rt.dyn_res.OnPresent(/*in_menu_or_pause=*/false, &new_scale)) {
-                    if (g_rt.window) {
-                        g_rt.renderer.Resize(
-                            static_cast<uint32_t>(ANativeWindow_getWidth(g_rt.window)),
-                            static_cast<uint32_t>(ANativeWindow_getHeight(g_rt.window)),
-                            new_scale);
-                    }
+            // Keep swapchain presenting at 60 Hz until Crazy Taxi 3's own D3DDevice_Swap takes over
+            if (ct2::sdk_bridge::Metrics().presents.load(std::memory_order_relaxed) == 0) {
+                ++frame_index;
+                if (!g_rt.game_loop.TickFrameSkip() && g_rt.d3d) {
+                    g_rt.d3d->Clear(0xFF000000u);
+                    g_rt.d3d->Swap();
+                    g_rt.watchdog.NotifyPresent();
                 }
+            } else {
+                g_rt.watchdog.NotifyPresent();
             }
 
             const double title_ms =
@@ -133,6 +188,7 @@ Java_com_ct2recomp_android_NativeBridge_nativeInit(JNIEnv* env, jclass,
     std::lock_guard<std::mutex> lock(g_rt.mu);
     g_rt.files_dir = JStringToStd(env, j_files_dir);
     g_rt.cache_dir = JStringToStd(env, j_cache_dir);
+    ct2::sdk_bridge::SetHostPaths(g_rt.files_dir, g_rt.cache_dir);
 
     ct2::kernel::InitMemory(/*expand_ram_128mb=*/true);
     g_rt.save_guard = std::make_unique<ct2::host::SaveGuard>(g_rt.files_dir + "/saves");
@@ -143,6 +199,7 @@ Java_com_ct2recomp_android_NativeBridge_nativeInit(JNIEnv* env, jclass,
     cfg.cache_dir = g_rt.cache_dir + "/shadercache";
     cfg.enable_preload = true;
     g_rt.renderer.Initialize(cfg);
+    ct2::sdk_bridge::SetRenderer(&g_rt.renderer);
 
     g_rt.render_thread.Start([](const ct2::gfx::CmdBatch& batch, const uint8_t* ring) {
         g_rt.renderer.ReplayBatch(batch, ring);
@@ -160,6 +217,7 @@ Java_com_ct2recomp_android_NativeBridge_nativeOpenRomPath(JNIEnv* env, jclass,
     const std::string path = JStringToStd(env, j_rom_path);
     bool ok = path.empty() ? g_rt.rom.AutoDiscoverFromSdcard() : g_rt.rom.OpenPath(path);
     if (ok) {
+        g_rt.rom_open_path = g_rt.rom.Info().image_path;
         g_rt.rom_dir = g_rt.rom.Info().root_dir;
         ct2::diag::InitTelemetry(g_rt.files_dir, g_rt.rom_dir);
         ok = BootLoadedRomLocked();
@@ -174,6 +232,8 @@ Java_com_ct2recomp_android_NativeBridge_nativeOpenRomFd(JNIEnv* env, jclass,
                                                         jstring j_display_name) {
     std::lock_guard<std::mutex> lock(g_rt.mu);
     const std::string name = JStringToStd(env, j_display_name);
+    g_rt.rom_open_path.clear();
+    g_rt.rom_saf_fd = static_cast<int>(fd);
     bool ok = g_rt.rom.OpenFd(static_cast<int>(fd), name);
     if (ok) {
         ok = BootLoadedRomLocked();
@@ -206,21 +266,24 @@ JNIEXPORT jstring JNICALL
 Java_com_ct2recomp_android_NativeBridge_nativeGetDiagStatus(JNIEnv* env, jclass) {
     const auto& caps = g_rt.renderer.Caps();
     const auto snap = ct2::diag::LatestSnapshot();
+    const auto& m = ct2::sdk_bridge::Metrics();
     const uint32_t api_maj = (caps.api_version >> 22) & 0x7Fu;
     const uint32_t api_min = (caps.api_version >> 12) & 0x3FFu;
 
     const char* vendor_tag = caps.is_adreno ? "Adreno" : (caps.is_mali ? "Mali" : "Other");
-    char buf[1024];
+    char buf[1280];
     std::snprintf(
         buf, sizeof(buf),
-        "CT3 XBE Vulkan Diag (Scaffold -> Swapchain Active)\n"
+        "CT3 XBE Recomp: %s\n"
         "GPU: %s (%s 0x%04X) | VK %u.%u\n"
         "Quirks: dynRender=%s | timeline=%s | extDyn=%s | BC=%s\n"
         "Swapchain: %s (%ux%u, %u imgs) | Presents: %llu\n"
         "ROM: %s | XISO files: %zu\n"
         "XBE: %s | TitleID: 0x%08X | Entry: 0x%08X | Thunks: %zu\n"
+        "D3D8 Live: %ux%u | Clears: %llu (0x%08X) | Draws: %llu | Swaps: %llu\n"
         "Perf: %.1f FPS | title %.2fms | render %.2fms | gpu %.2fms\n"
         "Sys: CPU %.0f%% | GPU %.0f%% | Bat %.1fC | DynRes %u%%",
+        g_rt.boot_status.c_str(),
         caps.device_name.empty() ? "Unknown" : caps.device_name.c_str(),
         vendor_tag, caps.vendor_id, api_maj, api_min,
         caps.use_dynamic_rendering ? "ON" : "OFF(cachedRP)",
@@ -235,6 +298,11 @@ Java_com_ct2recomp_android_NativeBridge_nativeGetDiagStatus(JNIEnv* env, jclass)
         g_rt.rom.Xiso().FileCount(),
         g_rt.xbe_info.title_name.empty() ? "Pending" : g_rt.xbe_info.title_name.c_str(),
         g_rt.xbe_info.title_id, g_rt.xbe_info.entry_point, g_rt.kernel.BoundThunkCount(),
+        m.d3d_width.load(), m.d3d_height.load(),
+        static_cast<unsigned long long>(m.clears.load()),
+        m.last_clear_argb.load(),
+        static_cast<unsigned long long>(m.draws.load()),
+        static_cast<unsigned long long>(m.presents.load()),
         snap.fps, snap.title_ms, snap.render_ms, snap.gpu_ms,
         snap.cpu_load_pct, snap.gpu_load_pct, snap.battery_temp_c,
         g_rt.dyn_res.CurrentPercent());
@@ -282,6 +350,7 @@ Java_com_ct2recomp_android_NativeBridge_nativeShutdown(JNIEnv*, jclass) {
     if (g_rt.title_thread.joinable()) g_rt.title_thread.join();
 
     std::lock_guard<std::mutex> lock(g_rt.mu);
+    ct2::sdk_bridge::SetRenderer(nullptr);
     g_rt.d3d.reset();
     g_rt.render_thread.Stop();
     g_rt.renderer.Shutdown();
