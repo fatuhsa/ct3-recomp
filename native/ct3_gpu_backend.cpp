@@ -46,7 +46,7 @@ public:
         ct2::diag::AddCounters(fc);
     }
 
-    void Copy(const Surface&, const Surface&, uint32_t, uint32_t, uint32_t, float, float) override {
+    void Copy(const Surface&, const Surface&, uint32_t, uint32_t, uint32_t) override {
         ct2::sdk_bridge::Metrics().copies.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -67,6 +67,11 @@ public:
 
 std::unique_ptr<Backend> CreateBackend() {
     return std::make_unique<Ct3VulkanBackend>();
+}
+
+std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner) {
+    // Pass through cleanly on ARM64 (replaces SSE2-only sdk/runtime/gpu/render_thread.cpp)
+    return inner;
 }
 
 } // namespace gpu

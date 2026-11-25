@@ -95,9 +95,9 @@ if(CT3_USE_SDK)
     file(GLOB CT3_SDK_RUNTIME_SOURCES CONFIGURE_DEPENDS
         "${CT3_SDK_DIR}/runtime/*/*.cpp"
     )
-    # Exclude Windows-specific host layers (replaced by Android native/ct3_app_host.cpp + ct3_gpu_backend.cpp)
+    # Exclude Windows/x86-SSE2-only SDK host layers (replaced by Android native/ct3_app_host.cpp + ct3_gpu_backend.cpp)
     list(FILTER CT3_SDK_RUNTIME_SOURCES EXCLUDE REGEX
-        "/runtime/app/|/core/input\\.cpp$|/gpu/d3d12\\.cpp$|/audio/xaudio2\\.cpp$"
+        "/runtime/app/|/core/input\\.cpp$|/gpu/(d3d12|render_thread)\\.cpp$|/audio/xaudio2\\.cpp$"
     )
     list(APPEND CT2_HOST_SOURCES ${CT3_SDK_RUNTIME_SOURCES})
 endif()
