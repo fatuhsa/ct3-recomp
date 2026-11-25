@@ -152,7 +152,7 @@ void Pace() {
     static auto next_frame = Clock::now();
     const uint32_t cap = g_settings.fps_cap;
     if (cap == 0) return;
-    const auto step = std::chrono::microseconds(1000000 / (cap == kFpsCapRefresh ? 60 : cap));
+    const auto step = std::chrono::microseconds(1000000 / (cap <= 1 ? 60 : cap));
     const auto now = Clock::now();
     if (now < next_frame) {
         std::this_thread::sleep_until(next_frame);
