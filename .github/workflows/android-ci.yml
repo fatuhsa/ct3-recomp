@@ -7,8 +7,13 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
     inputs:
+      build_release:
+        description: "Build Release APK instead of Debug APK"
+        required: false
+        type: boolean
+        default: false
       profile_debuggable:
-        description: "Build Release APK with -Pdebuggable for unrooted simpleperf profiling"
+        description: "When build_release=true, pass -Pdebuggable for unrooted simpleperf profiling"
         required: false
         type: boolean
         default: false
@@ -158,22 +163,27 @@ jobs:
           gradle-version: '9.9.2'
           cache-provider: basic
 
-      - name: Build Debug & Release APKs (arm64-v8a)
+      - name: Build single Android APK (arm64-v8a, native -O2)
         shell: bash
         run: |
           set -euo pipefail
-          gradle -p android assembleDebug --no-daemon --stacktrace
-          RELEASE_ARGS=("assembleRelease" "--no-daemon" "--stacktrace")
-          if [[ "${{ inputs.profile_debuggable }}" == "true" ]]; then
-            RELEASE_ARGS+=("-Pdebuggable")
+          if [[ "${{ inputs.build_release }}" == "true" ]]; then
+            ARGS=("assembleRelease" "--no-daemon" "--stacktrace")
+            if [[ "${{ inputs.profile_debuggable }}" == "true" ]]; then
+              ARGS+=("-Pdebuggable")
+            fi
+            gradle -p android "${ARGS[@]}"
+            echo "BUILD_VARIANT=release" >> "$GITHUB_ENV"
+          else
+            gradle -p android assembleDebug --no-daemon --stacktrace
+            echo "BUILD_VARIANT=debug" >> "$GITHUB_ENV"
           fi
-          gradle -p android "${RELEASE_ARGS[@]}"
 
       - name: Verify Android 15+ 16 KB ELF LOAD alignment on libmain.so
         shell: bash
         run: |
           set -euo pipefail
-          SO_PATH="$(find android/app/build/intermediates -path '*release*' -name 'libmain.so' | head -n 1)"
+          SO_PATH="$(find android/app/build/intermediates/cxx -name 'libmain.so' | head -n 1)"
           test -n "$SO_PATH"
           echo "Inspecting: $SO_PATH"
           readelf -lW "$SO_PATH"
@@ -185,13 +195,11 @@ jobs:
           fi
           echo "OK: All LOAD segments in libmain.so are 16 KB aligned."
 
-      - name: Upload APKs
+      - name: Upload APK
         uses: actions/upload-artifact@v7
         with:
-          name: ct3-recomp-arm64-apks
-          path: |
-            android/app/build/outputs/apk/debug/*.apk
-            android/app/build/outputs/apk/release/*.apk
+          name: ct3-recomp-arm64-apk
+          path: android/app/build/outputs/apk/${{ env.BUILD_VARIANT }}/*.apk
           if-no-files-found: error
           retention-days: 14
 
@@ -199,6 +207,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ct3-recomp-arm64-symbols
-          path: android/app/build/intermediates/cxx/Release/*/obj/arm64-v8a/libmain.so
+          path: android/app/build/intermediates/cxx/**/obj/arm64-v8a/libmain.so
           if-no-files-found: warn
           retention-days: 14
