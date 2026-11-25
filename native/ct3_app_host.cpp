@@ -190,11 +190,13 @@ std::thread g_audio_thread;
 void Ct3OnLoaded() {
     // Map Xbox Utility Cache Drive Z:\ before Crazy Taxi 3 caches Media assets
     ::kernel::CreateSymbolicLink("\\??\\Z:", "\\Device\\Harddisk0\\Partition5");
-    // U: is the console's user save drive (E: / Harddisk0\Partition1). Crazy Taxi 3
-    // probes U:\<title-id>\SaveMeta.xbx during boot; without this link every save
-    // or options write fails with "no mapping for U:\...".
-    ::kernel::CreateSymbolicLink("\\??\\U:", "\\Device\\Harddisk0\\Partition1");
-    ct2::log::Info("CT3Boot", "Crazy Taxi 3 XBE image mapped into guest RAM (entry=0x000E0C34, Z: and U: linked)");
+    // U: and T: are XAPI's save links into Harddisk0\Partition1 (the E: data
+    // partition): UDATA for player saves, TDATA for title data. Crazy Taxi 3 probes
+    // U:\<title-id>\SaveMeta.xbx at boot; without these links every save or
+    // options write fails with "no mapping for U:\...".
+    ::kernel::CreateSymbolicLink("\\??\\U:", "\\Device\\Harddisk0\\Partition1\\UDATA");
+    ::kernel::CreateSymbolicLink("\\??\\T:", "\\Device\\Harddisk0\\Partition1\\TDATA");
+    ct2::log::Info("CT3Boot", "Crazy Taxi 3 XBE mapped (entry=0x000E0C34, Z:, U: and T: linked)");
 }
 
 void Ct3PadHook(int port, input::Pad& pad) {
