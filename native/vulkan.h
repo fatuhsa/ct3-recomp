@@ -220,6 +220,7 @@ private:
     uint32_t queue_family_ = 0;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     VkSemaphore timeline_sem_ = VK_NULL_HANDLE;
+    PFN_vkWaitSemaphores pfn_vkWaitSemaphores_ = nullptr;
 #endif
 };
 

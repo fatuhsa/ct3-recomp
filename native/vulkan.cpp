@@ -234,6 +234,15 @@ bool VulkanRenderer::InitVulkanDevice() {
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
 
     if (caps_.use_timeline_semaphores) {
+        pfn_vkWaitSemaphores_ = reinterpret_cast<PFN_vkWaitSemaphores>(
+            vkGetDeviceProcAddr(device_, "vkWaitSemaphores"));
+        if (!pfn_vkWaitSemaphores_) {
+            log::Warn("CT2Vk", "vkWaitSemaphores unavailable at runtime; falling back to VkFence pool");
+            caps_.use_timeline_semaphores = false;
+        }
+    }
+
+    if (caps_.use_timeline_semaphores) {
         VkSemaphoreTypeCreateInfo stci{};
         stci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
         stci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -353,13 +362,14 @@ void VulkanRenderer::StartPoolResetWorker() {
 
             FrameSlot& f = frames_[idx];
 #if CT2_HAS_VULKAN_HEADERS
-            if (device_ != VK_NULL_HANDLE && timeline_sem_ != VK_NULL_HANDLE && f.timeline_value > 0) {
+            if (device_ != VK_NULL_HANDLE && timeline_sem_ != VK_NULL_HANDLE &&
+                pfn_vkWaitSemaphores_ != nullptr && f.timeline_value > 0) {
                 VkSemaphoreWaitInfo wi{};
                 wi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
                 wi.semaphoreCount = 1;
                 wi.pSemaphores = &timeline_sem_;
                 wi.pValues = &f.timeline_value;
-                vkWaitSemaphores(device_, &wi, UINT64_MAX);
+                pfn_vkWaitSemaphores_(device_, &wi, UINT64_MAX);
             }
             if (device_ != VK_NULL_HANDLE && f.pool != VK_NULL_HANDLE) {
                 vkResetCommandPool(device_, f.pool, 0);

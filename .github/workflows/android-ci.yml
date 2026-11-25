@@ -175,6 +175,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ct3-recomp-arm64-symbols
-          path: android/app/build/intermediates/cmake/release/obj/arm64-v8a/libmain.so
+          path: android/app/build/intermediates/cxx/Release/*/obj/arm64-v8a/libmain.so
           if-no-files-found: warn
           retention-days: 14
