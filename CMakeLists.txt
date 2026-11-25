@@ -16,8 +16,12 @@ set(SDL_GPU OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+set(ENABLE_HLSL ON CACHE BOOL "" FORCE)
 set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
 set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
 
 set(CT3_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/sdk")
 set(CT3_GEN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated/game")
@@ -25,6 +29,14 @@ set(CT3_USE_SDK OFF)
 if(CT3_ENABLE_XBE_SDK AND EXISTS "${CT3_SDK_DIR}/runtime" AND EXISTS "${CT3_GEN_DIR}/x86_func_mapping.cpp")
     set(CT3_USE_SDK ON)
     message(STATUS "CT3: Full XboxXBERecomp SDK + 128 lifted Crazy Taxi 3 partitions ENABLED")
+    include(FetchContent)
+    FetchContent_Declare(
+        glslang
+        GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+        GIT_TAG 16.0.0
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(glslang)
 else()
     message(STATUS "CT3: Building standalone Vulkan diagnostic runtime (sdk/ or generated/game not enabled)")
 endif()
@@ -95,11 +107,14 @@ if(CT3_USE_SDK)
     file(GLOB CT3_SDK_RUNTIME_SOURCES CONFIGURE_DEPENDS
         "${CT3_SDK_DIR}/runtime/*/*.cpp"
     )
-    # Exclude Windows/x86-SSE2-only SDK host layers (replaced by Android native/ct3_app_host.cpp + ct3_gpu_backend.cpp)
+    # Exclude Windows/x86-SSE2-only SDK host layers (replaced by Android native/ct3_app_host.cpp + ct3_gpu_backend.cpp + gpu_render_thread.cpp)
     list(FILTER CT3_SDK_RUNTIME_SOURCES EXCLUDE REGEX
         "/runtime/app/|/core/input\\.cpp$|/gpu/(d3d12|render_thread)\\.cpp$|/audio/xaudio2\\.cpp$"
     )
-    list(APPEND CT2_HOST_SOURCES ${CT3_SDK_RUNTIME_SOURCES})
+    list(APPEND CT2_HOST_SOURCES
+        src/d3d/gpu_render_thread.cpp
+        ${CT3_SDK_RUNTIME_SOURCES}
+    )
 endif()
 
 if(ANDROID)
@@ -124,8 +139,14 @@ if(CT3_USE_SDK)
         "${CT3_SDK_DIR}/harness/compat"
         "${CT3_SDK_DIR}/runtime"
         "${CT3_GEN_DIR}"
+        "${glslang_SOURCE_DIR}"
     )
     target_compile_definitions(main PRIVATE CT3_ENABLE_XBE_SDK=1)
+    set_source_files_properties(native/vk_shader.cpp PROPERTIES COMPILE_DEFINITIONS ENABLE_HLSL=1)
+    set_source_files_properties(native/ct3_gpu_backend.cpp src/d3d/gpu_render_thread.cpp PROPERTIES
+        COMPILE_OPTIONS "-Wno-unused-function;-Wno-unused-variable;-Wno-reorder"
+    )
+    target_link_libraries(main PRIVATE glslang glslang-default-resource-limits)
 endif()
 
 # Match x86 signed char and aliasing semantics on ARM64 host sources
@@ -160,9 +181,10 @@ target_link_libraries(main PRIVATE Threads::Threads)
 if(ANDROID)
     find_library(ANDROID_LIB android REQUIRED)
     find_library(LOG_LIB log REQUIRED)
+    find_library(AAUDIO_LIB aaudio REQUIRED)
     find_library(VULKAN_LIB vulkan)
 
-    target_link_libraries(main PRIVATE ${ANDROID_LIB} ${LOG_LIB} dl)
+    target_link_libraries(main PRIVATE ${ANDROID_LIB} ${LOG_LIB} ${AAUDIO_LIB} dl)
     if(VULKAN_LIB)
         target_link_libraries(main PRIVATE ${VULKAN_LIB})
     endif()

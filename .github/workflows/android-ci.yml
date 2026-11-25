@@ -68,9 +68,118 @@ jobs:
           mv "${RUNNER_TEMP}/mw_sdk/sdk" ./sdk
           rm -rf "${RUNNER_TEMP}/mw_sdk"
 
-          # Patch kernel::Disc::Open so Android SAF "/proc/self/fd/<N>" uses dup(N) instead of SELinux-blocked open()
+          # 1. Patch kernel::Disc::Open so Android SAF "/proc/self/fd/<N>" uses dup(N) instead of SELinux-blocked open()
           perl -0777 -i -pe 's/file_ = open\(path\.c_str\(\), O_RDONLY\);/if (path.string().rfind("\/proc\/self\/fd\/", 0) == 0) { file_ = dup(std::stoi(path.string().substr(14))); } else { file_ = open(path.c_str(), O_RDONLY); }/' sdk/runtime/kernel/disc.cpp
           grep -n "proc/self/fd" sdk/runtime/kernel/disc.cpp
+
+          # 2. Patch sdk/runtime/xdk/d3d8.cpp for XDK 4531 D3DRS numbering (83 simple, 83..117 deferred, 118..146 complex)
+          #    and add HLE_STDCALL(D3DDevice_SetVertexShaderInput, 3) used by Crazy Taxi 3 mesh draws!
+          python3 - << 'PY'
+          from pathlib import Path
+
+          p = Path("sdk/runtime/xdk/d3d8.cpp")
+          s = p.read_text()
+
+          old_sync = """void SyncDeferred() {
+              // deferred states live in the title's memory, the inline SetRenderState and SetTextureStageState write them
+              for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsComplexFirst; i++) g_state.rs[i] = R32(kRenderState + i * 4);
+              for (int s = 0; s < 4; s++)
+                  for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) g_state.tss[s][i] = R32(kTextureState + (s * kStageStates + i) * 4);
+          }"""
+          old_sync = "\n".join(line[10:] if line.startswith("          ") else line for line in old_sync.splitlines())
+
+          new_sync = """void SyncDeferred() {
+              // XDK 4531 deferred render states: [83..114] -> kRsFogEnable..kRsPointSizeMax (+9), [117] -> kRsPresentationInterval
+              for (uint32_t rs = 83; rs <= 114; rs++) g_state.rs[rs + 9] = R32(kRenderState + rs * 4);
+              g_state.rs[gpu::kRsPresentationInterval] = R32(kRenderState + 117 * 4);
+              for (int s = 0; s < 4; s++)
+                  for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) g_state.tss[s][i] = R32(kTextureState + (s * kStageStates + i) * 4);
+          }"""
+          new_sync = "\n".join(line[10:] if line.startswith("          ") else line for line in new_sync.splitlines())
+          assert old_sync in s, "SyncDeferred block not found"
+          s = s.replace(old_sync, new_sync, 1)
+
+          old_complex = """void SetComplex(uint32_t rs, uint32_t v) {
+              g_state.rs[rs] = v;
+              W32(kRenderState + rs * 4, v);
+          }"""
+          old_complex = "\n".join(line[10:] if line.startswith("          ") else line for line in old_complex.splitlines())
+          new_complex = """void SetComplex(uint32_t rs, uint32_t v) {
+              g_state.rs[rs] = v;
+              if (rs >= 18) W32(kRenderState + (rs - 18) * 4, v);
+          }"""
+          new_complex = "\n".join(line[10:] if line.startswith("          ") else line for line in new_complex.splitlines())
+          assert old_complex in s, "SetComplex block not found"
+          s = s.replace(old_complex, new_complex, 1)
+
+          old_rs = """HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
+              uint32_t rs = a[0], v = a[1];
+              if (rs < gpu::kRsDeferredFirst) {
+                  uint32_t method = R32(kSimpleEncode + rs * 4) & 0x1FFC;
+                  g_state.simple[method >> 2] = v;
+                  W32(kRenderState + rs * 4, v);  // titles read their states back from the library's table
+              } else if (rs < gpu::kRsMax) {
+                  SetComplex(rs, v);
+              }
+              return 0;
+          }"""
+          old_rs = "\n".join(line[10:] if line.startswith("          ") else line for line in old_rs.splitlines())
+          new_rs = """HLE_STDCALL(D3DDevice_SetRenderStateNotInline, 2) {
+              uint32_t rs = a[0], v = a[1];
+              if (rs < 83) {
+                  uint32_t method = R32(kSimpleEncode + rs * 4) & 0x1FFC;
+                  g_state.simple[method >> 2] = v;
+                  W32(kRenderState + rs * 4, v);
+              } else if (rs < 118) {
+                  W32(kRenderState + rs * 4, v);
+                  if (rs <= 114) g_state.rs[rs + 9] = v;
+                  else if (rs == 117) g_state.rs[gpu::kRsPresentationInterval] = v;
+              } else if (rs + 18 < gpu::kRsMax) {
+                  SetComplex(rs + 18, v);
+              }
+              return 0;
+          }"""
+          new_rs = "\n".join(line[10:] if line.startswith("          ") else line for line in new_rs.splitlines())
+          assert old_rs in s, "SetRenderStateNotInline block not found"
+          s = s.replace(old_rs, new_rs, 1)
+
+          vs_input_hook = """
+          #ifdef SYM_D3DDevice_SetVertexShaderInput
+          HLE_STDCALL(D3DDevice_SetVertexShaderInput, 3) {
+              std::lock_guard<std::recursive_mutex> lock(g_lock);
+              static uint32_t s_hdrs[16] = {};
+              if (!a[0]) {
+                  for (uint32_t i = 0; i < 16; i++) g_state.streams[i] = {0, 0};
+                  return 0;
+              }
+              uint32_t count = std::min<uint32_t>(a[1], 16), inputs = a[2];
+              for (uint32_t i = 0; i < 16; i++) {
+                  if (i >= count || !inputs) {
+                      g_state.streams[i] = {0, 0};
+                      continue;
+                  }
+                  uint32_t vb = R32(inputs + i * 12 + 0);
+                  uint32_t stride = R32(inputs + i * 12 + 4);
+                  uint32_t offset = R32(inputs + i * 12 + 8);
+                  if (vb && offset) {
+                      uint32_t& h = s_hdrs[i];
+                      if (!h) h = mem::AllocSystem(20);
+                      std::memcpy(HostPtr(h), HostPtr(vb), 20);
+                      W32(h + 4, R32(vb + 4) + offset);
+                      g_state.streams[i] = {h, stride};
+                  } else {
+                      g_state.streams[i] = {vb, stride};
+                  }
+              }
+              return 0;
+          }
+          #endif
+          """
+          vs_input_hook = "\n".join(line[10:] if line.startswith("          ") else line for line in vs_input_hook.splitlines())
+          s += "\n" + vs_input_hook + "\n"
+          p.write_text(s)
+          print("Patched sdk/runtime/xdk/d3d8.cpp for XDK 4531 + SetVertexShaderInput.")
+          PY
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang ninja-build

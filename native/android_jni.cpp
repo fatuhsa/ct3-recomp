@@ -20,6 +20,7 @@
 #include "kernel/kernel.h"
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -128,7 +129,7 @@ bool BootLoadedRomLocked() {
         std::filesystem::create_directories(data_dir, ec);
 
         if (::kernel::Boot(std::move(xbe_bytes), "default.xbe", game_dir, data_dir)) {
-            g_rt.boot_status = "LIVE (128 lifted XBE partitions running)";
+            g_rt.boot_status = "LIVE 3D (128 XBE Partitions)";
             ct2::log::Info("CT3Boot", "XboxXBERecomp kernel::Boot started Crazy Taxi 3 entry 0x%08X!",
                            g_rt.xbe_info.entry_point);
         } else {
@@ -144,7 +145,7 @@ bool BootLoadedRomLocked() {
     if (g_rt.running.exchange(true)) return true;
     g_rt.title_thread = std::thread([] {
         g_rt.watchdog.RegisterThread("HostPacer", pthread_self(), &g_rt.cpu_ctx.eip);
-        uint64_t frame_index = 0;
+        uint64_t last_presents = 0;
 
         while (g_rt.running.load(std::memory_order_acquire)) {
             if (g_rt.paused.load(std::memory_order_acquire)) {
@@ -152,23 +153,20 @@ bool BootLoadedRomLocked() {
                 continue;
             }
 
-            const auto t0 = std::chrono::steady_clock::now();
-            // Keep swapchain presenting at 60 Hz until Crazy Taxi 3's own D3DDevice_Swap takes over
-            if (ct2::sdk_bridge::Metrics().presents.load(std::memory_order_relaxed) == 0) {
-                ++frame_index;
-                if (!g_rt.game_loop.TickFrameSkip() && g_rt.d3d) {
-                    g_rt.d3d->Clear(0xFF000000u);
-                    g_rt.d3d->Swap();
-                    g_rt.watchdog.NotifyPresent();
-                }
-            } else {
+#ifdef CT3_ENABLE_XBE_SDK
+            const uint64_t cur_presents = ct2::sdk_bridge::Metrics().presents.load(std::memory_order_relaxed);
+            if (cur_presents != last_presents) {
+                last_presents = cur_presents;
                 g_rt.watchdog.NotifyPresent();
             }
-
-            const double title_ms =
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                    .count();
-            ct2::diag::RecordTitleFrameMs(title_ms);
+#else
+            if (!g_rt.game_loop.TickFrameSkip() && g_rt.d3d) {
+                g_rt.d3d->Clear(0xFF000000u);
+                g_rt.d3d->Swap();
+                g_rt.watchdog.NotifyPresent();
+            }
+            (void)last_presents;
+#endif
             std::this_thread::sleep_for(std::chrono::milliseconds(16));
         }
 
@@ -195,6 +193,7 @@ Java_com_ct2recomp_android_NativeBridge_nativeInit(JNIEnv* env, jclass,
     ct2::diag::InitTelemetry(g_rt.files_dir, g_rt.rom_dir);
     g_rt.watchdog.Start(g_rt.files_dir + "/logs");
 
+#ifndef CT3_ENABLE_XBE_SDK
     ct2::vk::RendererConfig cfg{};
     cfg.cache_dir = g_rt.cache_dir + "/shadercache";
     cfg.enable_preload = true;
@@ -205,6 +204,7 @@ Java_com_ct2recomp_android_NativeBridge_nativeInit(JNIEnv* env, jclass,
         g_rt.renderer.ReplayBatch(batch, ring);
     });
     g_rt.d3d = std::make_unique<ct2::d3d::D3D8Bridge>(&g_rt.render_thread);
+#endif
 
     ClearJniException(env, "nativeInit");
     return JNI_TRUE;
@@ -246,7 +246,11 @@ JNIEXPORT void JNICALL
 Java_com_ct2recomp_android_NativeBridge_nativeSetSurface(JNIEnv* env, jclass, jobject surface) {
     std::lock_guard<std::mutex> lock(g_rt.mu);
     if (g_rt.window) {
+#ifdef CT3_ENABLE_XBE_SDK
+        ct2::sdk_bridge::SetAndroidWindow(nullptr, 0, 0);
+#else
         g_rt.renderer.SetNativeWindow(nullptr, 0, 0);
+#endif
         ANativeWindow_release(g_rt.window);
         g_rt.window = nullptr;
     }
@@ -255,8 +259,12 @@ Java_com_ct2recomp_android_NativeBridge_nativeSetSurface(JNIEnv* env, jclass, jo
         if (g_rt.window) {
             const uint32_t w = static_cast<uint32_t>(ANativeWindow_getWidth(g_rt.window));
             const uint32_t h = static_cast<uint32_t>(ANativeWindow_getHeight(g_rt.window));
+#ifdef CT3_ENABLE_XBE_SDK
+            ct2::sdk_bridge::SetAndroidWindow(g_rt.window, w, h);
+#else
             g_rt.renderer.SetNativeWindow(g_rt.window, w, h);
             g_rt.renderer.Resize(w, h, g_rt.dyn_res.CurrentPercent());
+#endif
         }
     }
     ClearJniException(env, "nativeSetSurface");
@@ -264,48 +272,64 @@ Java_com_ct2recomp_android_NativeBridge_nativeSetSurface(JNIEnv* env, jclass, jo
 
 JNIEXPORT jstring JNICALL
 Java_com_ct2recomp_android_NativeBridge_nativeGetDiagStatus(JNIEnv* env, jclass) {
-    const auto& caps = g_rt.renderer.Caps();
     const auto snap = ct2::diag::LatestSnapshot();
     const auto& m = ct2::sdk_bridge::Metrics();
+
+#ifdef CT3_ENABLE_XBE_SDK
+    const std::string gpu_name = ct2::sdk_bridge::GetGpuDeviceName();
+    const uint32_t vendor_id = m.vendor_id.load();
+    const uint32_t api_ver = m.api_version.load();
+    const uint32_t api_maj = (api_ver >> 22) & 0x7Fu;
+    const uint32_t api_min = (api_ver >> 12) & 0x3FFu;
+    const char* vendor_tag = (vendor_id == 0x5143) ? "Adreno" : ((vendor_id == 0x13B5) ? "Mali" : "Mobile");
+
+    char buf[1280];
+    std::snprintf(
+        buf, sizeof(buf),
+        "CT3 XBE Recomp: %s\n"
+        "GPU: %s (%s 0x%04X) | VK %u.%u | %.1f FPS (GPU %.0f%%)\n"
+        "Quirks: dynRender=%s | timeline=%s | BC=%s\n"
+        "Swapchain: %s (%ux%u, %u imgs) | D3D8: %ux%u\n"
+        "Draws: %llu | Clears: %llu (0x%08X) | Copies: %llu | Swaps: %llu\n"
+        "ROM: %s (%zu files) | Bat %.1fC",
+        g_rt.boot_status.c_str(),
+        gpu_name.empty() ? "Init..." : gpu_name.c_str(),
+        vendor_tag, vendor_id, api_maj, api_min,
+        static_cast<double>(m.fps.load()),
+        static_cast<double>(m.gpu_load_pct.load()),
+        m.dynamic_rendering.load() ? "ON" : "CachedRP",
+        m.timeline_sem.load() ? "VK1.2" : "VkFence",
+        m.bc_supported.load() ? "HW" : "CPU-Cap384M",
+        m.vk_ready.load() ? "OK" : "WAIT",
+        m.swap_width.load(), m.swap_height.load(), m.swap_images.load(),
+        m.d3d_width.load(), m.d3d_height.load(),
+        static_cast<unsigned long long>(m.draws.load()),
+        static_cast<unsigned long long>(m.clears.load()),
+        m.last_clear_argb.load(),
+        static_cast<unsigned long long>(m.copies.load()),
+        static_cast<unsigned long long>(m.presents.load()),
+        g_rt.rom.IsOpen() ? g_rt.rom.Info().display_name.c_str() : "Not loaded",
+        g_rt.rom.Xiso().FileCount(),
+        snap.battery_temp_c);
+#else
+    const auto& caps = g_rt.renderer.Caps();
     const uint32_t api_maj = (caps.api_version >> 22) & 0x7Fu;
     const uint32_t api_min = (caps.api_version >> 12) & 0x3FFu;
-
     const char* vendor_tag = caps.is_adreno ? "Adreno" : (caps.is_mali ? "Mali" : "Other");
     char buf[1280];
     std::snprintf(
         buf, sizeof(buf),
         "CT3 XBE Recomp: %s\n"
         "GPU: %s (%s 0x%04X) | VK %u.%u\n"
-        "Quirks: dynRender=%s | timeline=%s | extDyn=%s | BC=%s\n"
-        "Swapchain: %s (%ux%u, %u imgs) | Presents: %llu\n"
-        "ROM: %s | XISO files: %zu\n"
-        "XBE: %s | TitleID: 0x%08X | Entry: 0x%08X | Thunks: %zu\n"
-        "D3D8 Live: %ux%u | Clears: %llu (0x%08X) | Draws: %llu | Swaps: %llu\n"
-        "Perf: %.1f FPS | title %.2fms | render %.2fms | gpu %.2fms\n"
-        "Sys: CPU %.0f%% | GPU %.0f%% | Bat %.1fC | DynRes %u%%",
+        "Swapchain: %s (%ux%u, %u imgs) | Presents: %llu",
         g_rt.boot_status.c_str(),
         caps.device_name.empty() ? "Unknown" : caps.device_name.c_str(),
         vendor_tag, caps.vendor_id, api_maj, api_min,
-        caps.use_dynamic_rendering ? "ON" : "OFF(cachedRP)",
-        caps.use_timeline_semaphores ? "VK1.2" : "VkFence",
-        caps.use_extended_dynamic_state ? "ON" : "OFF",
-        caps.supports_bc ? "HW" : "CPU-Cap384M",
         g_rt.renderer.SwapchainReady() ? "OK" : "WAIT",
         g_rt.renderer.SwapchainWidth(), g_rt.renderer.SwapchainHeight(),
         g_rt.renderer.SwapchainImageCount(),
-        static_cast<unsigned long long>(g_rt.renderer.PresentCount()),
-        g_rt.rom.IsOpen() ? g_rt.rom.Info().display_name.c_str() : "Not loaded",
-        g_rt.rom.Xiso().FileCount(),
-        g_rt.xbe_info.title_name.empty() ? "Pending" : g_rt.xbe_info.title_name.c_str(),
-        g_rt.xbe_info.title_id, g_rt.xbe_info.entry_point, g_rt.kernel.BoundThunkCount(),
-        m.d3d_width.load(), m.d3d_height.load(),
-        static_cast<unsigned long long>(m.clears.load()),
-        m.last_clear_argb.load(),
-        static_cast<unsigned long long>(m.draws.load()),
-        static_cast<unsigned long long>(m.presents.load()),
-        snap.fps, snap.title_ms, snap.render_ms, snap.gpu_ms,
-        snap.cpu_load_pct, snap.gpu_load_pct, snap.battery_temp_c,
-        g_rt.dyn_res.CurrentPercent());
+        static_cast<unsigned long long>(g_rt.renderer.PresentCount()));
+#endif
 
     jstring res = env->NewStringUTF(buf);
     ClearJniException(env, "nativeGetDiagStatus");
@@ -321,7 +345,35 @@ JNIEXPORT void JNICALL
 Java_com_ct2recomp_android_NativeBridge_nativeSetForeground(JNIEnv*, jclass, jboolean fg) {
     const bool is_fg = (fg == JNI_TRUE);
     g_rt.paused.store(!is_fg, std::memory_order_release);
+    ct2::sdk_bridge::SetForeground(is_fg);
     g_rt.watchdog.SetForeground(is_fg);
+}
+
+JNIEXPORT void JNICALL
+Java_com_ct2recomp_android_NativeBridge_nativeSetPadState(
+    JNIEnv*, jclass, jboolean is_hardware, jint buttons,
+    jint lx, jint ly, jint rx, jint ry,
+    jint a, jint b, jint x, jint y,
+    jint black, jint white, jint lt, jint rt) {
+    ct2::sdk_bridge::GamepadState st{};
+    st.buttons = static_cast<uint16_t>(buttons & 0xFFFF);
+    st.lx = static_cast<int16_t>(std::clamp(int(lx), -32768, 32767));
+    st.ly = static_cast<int16_t>(std::clamp(int(ly), -32768, 32767));
+    st.rx = static_cast<int16_t>(std::clamp(int(rx), -32768, 32767));
+    st.ry = static_cast<int16_t>(std::clamp(int(ry), -32768, 32767));
+    st.analog[0] = static_cast<uint8_t>(std::clamp(int(a), 0, 255));
+    st.analog[1] = static_cast<uint8_t>(std::clamp(int(b), 0, 255));
+    st.analog[2] = static_cast<uint8_t>(std::clamp(int(x), 0, 255));
+    st.analog[3] = static_cast<uint8_t>(std::clamp(int(y), 0, 255));
+    st.analog[4] = static_cast<uint8_t>(std::clamp(int(black), 0, 255));
+    st.analog[5] = static_cast<uint8_t>(std::clamp(int(white), 0, 255));
+    st.analog[6] = static_cast<uint8_t>(std::clamp(int(lt), 0, 255));
+    st.analog[7] = static_cast<uint8_t>(std::clamp(int(rt), 0, 255));
+    if (is_hardware == JNI_TRUE) {
+        ct2::sdk_bridge::SetHardwarePadState(st);
+    } else {
+        ct2::sdk_bridge::SetTouchPadState(st);
+    }
 }
 
 JNIEXPORT void JNICALL
@@ -350,6 +402,7 @@ Java_com_ct2recomp_android_NativeBridge_nativeShutdown(JNIEnv*, jclass) {
     if (g_rt.title_thread.joinable()) g_rt.title_thread.join();
 
     std::lock_guard<std::mutex> lock(g_rt.mu);
+    ct2::sdk_bridge::SetAndroidWindow(nullptr, 0, 0);
     ct2::sdk_bridge::SetRenderer(nullptr);
     g_rt.d3d.reset();
     g_rt.render_thread.Stop();

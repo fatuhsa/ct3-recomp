@@ -14,6 +14,22 @@ object NativeBridge {
     external fun nativeSetBatteryTempC(tempC: Float)
     external fun nativeSetForeground(foreground: Boolean)
     external fun nativeGetDiagStatus(): String
+    external fun nativeSetPadState(
+        isHardware: Boolean,
+        buttons: Int,
+        lx: Int,
+        ly: Int,
+        rx: Int,
+        ry: Int,
+        a: Int,
+        b: Int,
+        x: Int,
+        y: Int,
+        black: Int,
+        white: Int,
+        lt: Int,
+        rt: Int
+    )
     external fun nativeSetGraphicsSwitches(
         reflectionCadence: Int,
         roadReflections: Boolean,

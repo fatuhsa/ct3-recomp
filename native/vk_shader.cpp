@@ -6,8 +6,16 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <regex>
 #include <sstream>
+
+#ifdef CT3_ENABLE_XBE_SDK
+#include <SPIRV/GlslangToSpv.h>
+#include <glslang/Public/ResourceLimits.h>
+#include <glslang/Public/ShaderLang.h>
+#include "core/log.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -88,11 +96,6 @@ uint64_t ShaderCache::HashSource(const std::string& text) {
 }
 
 std::string ShaderCache::Specialize(const std::string& hlsl_source) {
-    // Detect HLSL helper functions with Texture*/Sampler* parameters, e.g.:
-    //   float4 SampleTex(Texture2D tex, SamplerState smp, float2 uv) { ... }
-    // Rewrite each call site to a specialized helper that binds global texture/sampler
-    // identifiers directly and place specialized helpers after globals so glslang
-    // (with ENABLE_OPT=OFF) never emits VUID-06924 opaque-variable stores on ARM Mali.
     static const std::regex kFuncHeader(
         R"((float[1-4]?|half[1-4]?|int[1-4]?|uint[1-4]?|void)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*(?:Texture|Sampler)[^)]*)\)\s*\{)");
 
@@ -108,7 +111,6 @@ std::string ShaderCache::Specialize(const std::string& hlsl_source) {
         const size_t fn_start = static_cast<size_t>(m.position(0));
         const size_t body_open = fn_start + m.length(0) - 1;
 
-        // Find matching closing brace for the helper body.
         int depth = 1;
         size_t pos = body_open + 1;
         while (pos < work.size() && depth > 0) {
@@ -121,10 +123,8 @@ std::string ShaderCache::Specialize(const std::string& hlsl_source) {
         const std::string body = work.substr(body_open + 1, pos - body_open - 2);
         const auto params = SplitArgs(params_raw);
 
-        // Remove original generic helper definition.
         work.erase(fn_start, pos - fn_start);
 
-        // Replace each call site func_name(arg0, arg1, ...) with a specialized variant.
         const std::regex call_re("\\b" + func_name + R"(\s*\(([^;{}]*?)\))");
         std::string rewritten;
         std::sregex_iterator it(work.begin(), work.end(), call_re);
@@ -176,7 +176,6 @@ std::string ShaderCache::Specialize(const std::string& hlsl_source) {
     const std::string defs = specialized_defs.str();
     if (defs.empty()) return hlsl_source;
 
-    // Insert specialized helpers just before main/entry function so globals are already declared.
     const size_t entry_pos = work.find("main(");
     if (entry_pos != std::string::npos) {
         const size_t line_start = work.rfind('\n', entry_pos);
@@ -279,3 +278,115 @@ bool ShaderCache::ClaimPsoBuild(const PsoKey& key) {
 }
 
 } // namespace ct2::vk
+
+#ifdef CT3_ENABLE_XBE_SDK
+namespace vkshader {
+
+namespace {
+
+fs::path g_dir;
+std::mutex g_lock;
+constexpr uint32_t kCacheVersion = ct2::vk::kShaderCacheVersion;
+
+// Pre-specialize opaque Texture*/Sampler* helper args for ARM Mali (VUID-06924),
+// rewrite fxc 1.#INF, and bind ATTRn inputs to Vulkan [[vk::location(n)]].
+std::string Adapt(const std::string& hlsl) {
+    std::string s = ct2::vk::ShaderCache::Specialize(hlsl);
+    for (size_t at; (at = s.find("1.#INF")) != std::string::npos;) {
+        s.replace(at, 6, "asfloat(0x7F800000u)");
+    }
+    static const std::regex attr(R"((\n[ \t]*)(\w+ v\d+ : ATTR(\d+);))");
+    return std::regex_replace(s, attr, "$1[[vk::location($3)]] $2");
+}
+
+fs::path CachePath(uint64_t hash) {
+    char name[40];
+    std::snprintf(name, sizeof(name), "%016llx_%u.spv",
+                  static_cast<unsigned long long>(hash), kCacheVersion);
+    return g_dir / name;
+}
+
+bool Load(uint64_t hash, std::vector<uint32_t>& spirv) {
+    if (g_dir.empty()) return false;
+    std::ifstream f(CachePath(hash), std::ios::binary | std::ios::ate);
+    if (!f) return false;
+    std::streamsize n = f.tellg();
+    if (n <= 0 || n % 4) return false;
+    spirv.resize(size_t(n) / 4);
+    f.seekg(0);
+    return bool(f.read(reinterpret_cast<char*>(spirv.data()), n));
+}
+
+void Store(uint64_t hash, const std::vector<uint32_t>& spirv) {
+    if (g_dir.empty()) return;
+    fs::path p = CachePath(hash), tmp = p;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary);
+        if (!f) return;
+        f.write(reinterpret_cast<const char*>(spirv.data()), std::streamsize(spirv.size() * 4));
+    }
+    std::error_code ec;
+    fs::rename(tmp, p, ec);
+}
+
+} // namespace
+
+void Init(const fs::path& cache_dir) {
+    std::lock_guard<std::mutex> lock(g_lock);
+    glslang::InitializeProcess();
+    std::error_code ec;
+    fs::create_directories(cache_dir, ec);
+    g_dir = ec ? fs::path() : cache_dir;
+}
+
+bool Cached(uint64_t hash, std::vector<uint32_t>& spirv) {
+    return Load(hash, spirv);
+}
+
+bool Compile(const std::string& hlsl, const char* entry, Stage stage, uint64_t hash, std::vector<uint32_t>& spirv) {
+    if (Load(hash, spirv)) return true;
+    std::lock_guard<std::mutex> lock(g_lock);
+    if (Load(hash, spirv)) return true;
+
+    EShLanguage lang = stage == Stage::Vertex ? EShLangVertex : EShLangFragment;
+    std::string text = Adapt(hlsl);
+    const char* src = text.c_str();
+    glslang::TShader sh(lang);
+    sh.setStrings(&src, 1);
+    sh.setEntryPoint("main");
+    sh.setSourceEntryPoint(entry);
+    sh.setEnvInput(glslang::EShSourceHlsl, lang, glslang::EShClientVulkan, 100);
+    sh.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
+    sh.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
+    sh.setHlslIoMapping(true);
+    sh.setAutoMapBindings(true);
+    sh.setAutoMapLocations(true);
+    sh.setShiftBinding(glslang::EResUbo, kBindingConstants);
+    sh.setShiftBinding(glslang::EResTexture, kBindingTextures);
+    sh.setShiftBinding(glslang::EResSampler, kBindingSamplers);
+
+    auto messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules | EShMsgReadHlsl | EShMsgHlslOffsets);
+    if (!sh.parse(GetDefaultResources(), 100, false, messages)) {
+        LOGE("vulkan: %s %s does not compile: %s", stage == Stage::Vertex ? "vertex" : "pixel", entry, sh.getInfoLog());
+        LOGE("%s", text.c_str());
+        return false;
+    }
+    glslang::TProgram program;
+    program.addShader(&sh);
+    if (!program.link(messages) || !program.mapIO()) {
+        LOGE("vulkan: %s does not link: %s", entry, program.getInfoLog());
+        return false;
+    }
+    glslang::SpvOptions options;
+    options.disableOptimizer = true;
+    options.validate = false;
+    spirv.clear();
+    glslang::GlslangToSpv(*program.getIntermediate(lang), spirv, &options);
+    if (spirv.empty()) return false;
+    Store(hash, spirv);
+    return true;
+}
+
+} // namespace vkshader
+#endif // CT3_ENABLE_XBE_SDK

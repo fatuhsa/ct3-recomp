@@ -1,9 +1,12 @@
 package com.ct2recomp.android
 
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
@@ -11,11 +14,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.graphics.Typeface
 import android.util.Log
 import android.view.Gravity
+import android.view.InputDevice
+import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -25,23 +31,65 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     companion object {
         private const val TAG = "CT2MainActivity"
+
+        // Xbox XINPUT_GAMEPAD button bits
+        private const val BTN_DPAD_UP = 0x0001
+        private const val BTN_DPAD_DOWN = 0x0002
+        private const val BTN_DPAD_LEFT = 0x0004
+        private const val BTN_DPAD_RIGHT = 0x0008
+        private const val BTN_START = 0x0010
+        private const val BTN_BACK = 0x0020
     }
 
     private lateinit var surfaceView: SurfaceView
     private var hudText: TextView? = null
     private var romOverlay: LinearLayout? = null
+    private var touchOverlay: FrameLayout? = null
     private var statusText: TextView? = null
     private var romLoaded = false
+    private var surfaceReady = false
+    private var hudVisible = true
+
+    // Touch controller state
+    private var touchButtons = 0
+    private var touchLx = 0
+    private var touchLy = 0
+    private var touchA = 0
+    private var touchB = 0
+    private var touchX = 0
+    private var touchY = 0
+    private var touchBlack = 0
+    private var touchWhite = 0
+    private var touchLt = 0
+    private var touchRt = 0
+
+    // Hardware controller state
+    private var hwButtons = 0
+    private var hwLx = 0
+    private var hwLy = 0
+    private var hwRx = 0
+    private var hwRy = 0
+    private var hwA = 0
+    private var hwB = 0
+    private var hwX = 0
+    private var hwY = 0
+    private var hwBlack = 0
+    private var hwWhite = 0
+    private var hwLt = 0
+    private var hwRt = 0
 
     // 1 Hz UI-thread telemetry HUD updater (zero per-frame JNI calls).
     private val uiHandler = Handler(Looper.getMainLooper())
     private val hudUpdater = object : Runnable {
         override fun run() {
-            hudText?.text = NativeBridge.nativeGetDiagStatus()
+            if (hudVisible) {
+                hudText?.text = NativeBridge.nativeGetDiagStatus()
+            }
             uiHandler.postDelayed(this, 1000L)
         }
     }
@@ -66,7 +114,6 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             }
         }
 
-    // Push battery temperature only when Android broadcasts a change (zero per-frame JNI calls).
     private val batteryReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val tenthsC = intent?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0
@@ -80,27 +127,35 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // 1. Capture any crash/ANR tombstones from prior runs on unrooted devices.
         CrashLogs.dumpRecentExitReasons(this)
 
-        // 2. Initialize native host + Vulkan renderer + hang watchdog.
         val filesDir = (getExternalFilesDir(null) ?: filesDir).absolutePath
         val cacheDir = (externalCacheDir ?: cacheDir).absolutePath
         NativeBridge.nativeInit(filesDir, cacheDir)
 
-        // 3. Build fullscreen Vulkan surface + lightweight ROM prompt overlay if needed.
         val root = FrameLayout(this)
         surfaceView = SurfaceView(this).apply {
             holder.addCallback(this@MainActivity)
         }
         root.addView(surfaceView)
 
+        val controls = buildTouchControls()
+        touchOverlay = controls
+        controls.visibility = View.GONE
+        root.addView(
+            controls,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+
         val hud = TextView(this).apply {
             typeface = Typeface.MONOSPACE
-            textSize = 11f
+            textSize = 10.5f
             setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0x99000000.toInt())
-            setPadding(20, 16, 20, 16)
+            setBackgroundColor(0x88000000.toInt())
+            setPadding(16, 12, 16, 12)
             text = "Initializing Vulkan + Crazy Taxi 3 XBE runtime..."
         }
         hudText = hud
@@ -111,7 +166,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.START
             ).apply {
-                setMargins(16, 16, 16, 16)
+                setMargins(16, 12, 16, 12)
             }
         )
 
@@ -126,7 +181,251 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             IntentFilter(Intent.ACTION_BATTERY_CHANGED),
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
-        tryAutoLoadRom()
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).roundToInt()
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun makePadButton(
+        label: String,
+        bgArgb: Int = 0x55222222,
+        wDp: Int = 62,
+        hDp: Int = 52,
+        onState: (Boolean) -> Unit
+    ): TextView {
+        val bg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(12).toFloat()
+            setColor(bgArgb)
+            setStroke(dp(1), 0x88FFFFFF.toInt())
+        }
+        return TextView(this).apply {
+            text = label
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xDDFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            background = bg
+            layoutParams = LinearLayout.LayoutParams(dp(wDp), dp(hDp)).apply {
+                setMargins(dp(5), dp(5), dp(5), dp(5))
+            }
+            setOnTouchListener { v, ev ->
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                        v.alpha = 1.0f
+                        onState(true)
+                        pushTouchPad()
+                        true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
+                        v.alpha = 0.78f
+                        onState(false)
+                        pushTouchPad()
+                        true
+                    }
+                    else -> true
+                }
+            }
+            alpha = 0.78f
+        }
+    }
+
+    private fun buildTouchControls(): FrameLayout {
+        val layer = FrameLayout(this)
+
+        // Top-center utility bar: BACK / START / HUD toggle
+        val topBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        topBar.addView(makePadButton("BACK", 0x55333333, 64, 38) { down ->
+            touchButtons = if (down) (touchButtons or BTN_BACK) else (touchButtons and BTN_BACK.inv())
+        })
+        topBar.addView(makePadButton("START", 0x66AA6600, 74, 38) { down ->
+            touchButtons = if (down) (touchButtons or BTN_START) else (touchButtons and BTN_START.inv())
+        })
+        val hudBtn = TextView(this).apply {
+            text = "HUD"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xDDFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(12).toFloat()
+                setColor(0x55333333)
+                setStroke(dp(1), 0x88FFFFFF.toInt())
+            }
+            layoutParams = LinearLayout.LayoutParams(dp(58), dp(38)).apply {
+                setMargins(dp(5), dp(5), dp(5), dp(5))
+            }
+            setOnClickListener {
+                hudVisible = !hudVisible
+                hudText?.visibility = if (hudVisible) View.VISIBLE else View.GONE
+            }
+        }
+        topBar.addView(hudBtn)
+        layer.addView(
+            topBar,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.END
+            ).apply {
+                setMargins(dp(12), dp(10), dp(16), 0)
+            }
+        )
+
+        // Bottom-left: D-Pad Up/Down (menu & gear) + Steer Left/Right (analog + D-pad)
+        val leftCluster = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val upRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        upRow.addView(makePadButton("▲", 0x55222222, 58, 44) { down ->
+            touchButtons = if (down) (touchButtons or BTN_DPAD_UP) else (touchButtons and BTN_DPAD_UP.inv())
+            touchLy = if (down) 32767 else 0
+        })
+        upRow.addView(makePadButton("▼", 0x55222222, 58, 44) { down ->
+            touchButtons = if (down) (touchButtons or BTN_DPAD_DOWN) else (touchButtons and BTN_DPAD_DOWN.inv())
+            touchLy = if (down) -32767 else 0
+        })
+        val steerRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        steerRow.addView(makePadButton("◀", 0x66224466, 78, 66) { down ->
+            touchButtons = if (down) (touchButtons or BTN_DPAD_LEFT) else (touchButtons and BTN_DPAD_LEFT.inv())
+            touchLx = if (down) -32767 else 0
+        })
+        steerRow.addView(makePadButton("▶", 0x66224466, 78, 66) { down ->
+            touchButtons = if (down) (touchButtons or BTN_DPAD_RIGHT) else (touchButtons and BTN_DPAD_RIGHT.inv())
+            touchLx = if (down) 32767 else 0
+        })
+        leftCluster.addView(upRow)
+        leftCluster.addView(steerRow)
+        layer.addView(
+            leftCluster,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.START
+            ).apply {
+                setMargins(dp(18), 0, 0, dp(16))
+            }
+        )
+
+        // Bottom-right: Crazy Taxi pedals (BRAKE LT / GAS RT) + action buttons (A/B/X/Y)
+        val rightCluster = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.END
+        }
+        val abxyTop = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        abxyTop.addView(makePadButton("X (HOP)", 0x66225588, 72, 46) { down -> touchX = if (down) 255 else 0 })
+        abxyTop.addView(makePadButton("Y", 0x66887711, 58, 46) { down -> touchY = if (down) 255 else 0 })
+
+        val abxyBot = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        abxyBot.addView(makePadButton("B (REV)", 0x66882222, 72, 50) { down -> touchB = if (down) 255 else 0 })
+        abxyBot.addView(makePadButton("A (DRV)", 0x66227733, 72, 50) { down -> touchA = if (down) 255 else 0 })
+
+        val pedals = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        pedals.addView(makePadButton("BRAKE", 0x77992222, 82, 64) { down -> touchLt = if (down) 255 else 0 })
+        pedals.addView(makePadButton("GAS", 0x77228833, 92, 64) { down -> touchRt = if (down) 255 else 0 })
+
+        rightCluster.addView(abxyTop)
+        rightCluster.addView(abxyBot)
+        rightCluster.addView(pedals)
+        layer.addView(
+            rightCluster,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END
+            ).apply {
+                setMargins(0, 0, dp(18), dp(16))
+            }
+        )
+
+        return layer
+    }
+
+    private fun pushTouchPad() {
+        NativeBridge.nativeSetPadState(
+            false,
+            touchButtons,
+            touchLx, touchLy, 0, 0,
+            touchA, touchB, touchX, touchY,
+            touchBlack, touchWhite, touchLt, touchRt
+        )
+    }
+
+    private fun pushHwPad() {
+        NativeBridge.nativeSetPadState(
+            true,
+            hwButtons,
+            hwLx, hwLy, hwRx, hwRy,
+            hwA, hwB, hwX, hwY,
+            hwBlack, hwWhite, hwLt, hwRt
+        )
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val src = event.source
+        val isGamepad = (src and InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD ||
+            (src and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+        if (isGamepad) {
+            val down = event.action == KeyEvent.ACTION_DOWN
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_BUTTON_A -> { hwA = if (down) 255 else 0; pushHwPad(); return true }
+                KeyEvent.KEYCODE_BUTTON_B -> { hwB = if (down) 255 else 0; pushHwPad(); return true }
+                KeyEvent.KEYCODE_BUTTON_X -> { hwX = if (down) 255 else 0; pushHwPad(); return true }
+                KeyEvent.KEYCODE_BUTTON_Y -> { hwY = if (down) 255 else 0; pushHwPad(); return true }
+                KeyEvent.KEYCODE_BUTTON_L1 -> { hwWhite = if (down) 255 else 0; pushHwPad(); return true }
+                KeyEvent.KEYCODE_BUTTON_R1 -> { hwBlack = if (down) 255 else 0; pushHwPad(); return true }
+                KeyEvent.KEYCODE_BUTTON_L2 -> { hwLt = if (down) 255 else 0; pushHwPad(); return true }
+                KeyEvent.KEYCODE_BUTTON_R2 -> { hwRt = if (down) 255 else 0; pushHwPad(); return true }
+                KeyEvent.KEYCODE_BUTTON_START -> {
+                    hwButtons = if (down) (hwButtons or BTN_START) else (hwButtons and BTN_START.inv())
+                    pushHwPad(); return true
+                }
+                KeyEvent.KEYCODE_BUTTON_SELECT -> {
+                    hwButtons = if (down) (hwButtons or BTN_BACK) else (hwButtons and BTN_BACK.inv())
+                    pushHwPad(); return true
+                }
+                KeyEvent.KEYCODE_DPAD_UP -> {
+                    hwButtons = if (down) (hwButtons or BTN_DPAD_UP) else (hwButtons and BTN_DPAD_UP.inv())
+                    pushHwPad(); return true
+                }
+                KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    hwButtons = if (down) (hwButtons or BTN_DPAD_DOWN) else (hwButtons and BTN_DPAD_DOWN.inv())
+                    pushHwPad(); return true
+                }
+                KeyEvent.KEYCODE_DPAD_LEFT -> {
+                    hwButtons = if (down) (hwButtons or BTN_DPAD_LEFT) else (hwButtons and BTN_DPAD_LEFT.inv())
+                    pushHwPad(); return true
+                }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    hwButtons = if (down) (hwButtons or BTN_DPAD_RIGHT) else (hwButtons and BTN_DPAD_RIGHT.inv())
+                    pushHwPad(); return true
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if ((ev.source and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK &&
+            ev.action == MotionEvent.ACTION_MOVE
+        ) {
+            hwLx = (ev.getAxisValue(MotionEvent.AXIS_X) * 32767f).roundToInt().coerceIn(-32768, 32767)
+            hwLy = (-ev.getAxisValue(MotionEvent.AXIS_Y) * 32767f).roundToInt().coerceIn(-32768, 32767)
+            hwRx = (ev.getAxisValue(MotionEvent.AXIS_Z) * 32767f).roundToInt().coerceIn(-32768, 32767)
+            hwRy = (-ev.getAxisValue(MotionEvent.AXIS_RZ) * 32767f).roundToInt().coerceIn(-32768, 32767)
+            val lt = maxOf(ev.getAxisValue(MotionEvent.AXIS_LTRIGGER), ev.getAxisValue(MotionEvent.AXIS_BRAKE))
+            val rt = maxOf(ev.getAxisValue(MotionEvent.AXIS_RTRIGGER), ev.getAxisValue(MotionEvent.AXIS_GAS))
+            hwLt = (lt * 255f).roundToInt().coerceIn(0, 255)
+            hwRt = (rt * 255f).roundToInt().coerceIn(0, 255)
+            pushHwPad()
+            return true
+        }
+        return super.dispatchGenericMotionEvent(ev)
     }
 
     private fun buildRomOverlay(): LinearLayout {
@@ -182,7 +481,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private fun tryAutoLoadRom() {
-        if (romLoaded) return
+        if (romLoaded || !surfaceReady) return
 
         // Priority 1: Direct /sdcard/crazy taxi (and variants)
         val direct = RomLocator.findDirectSdcardRom(this)
@@ -211,7 +510,8 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
 
     private fun onRomMounted(label: String) {
         romLoaded = true
-        romOverlay?.visibility = LinearLayout.GONE
+        romOverlay?.visibility = View.GONE
+        touchOverlay?.visibility = View.VISIBLE
         Log.i(TAG, "ROM mounted: $label")
     }
 
@@ -220,7 +520,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         NativeBridge.nativeSetForeground(true)
         uiHandler.removeCallbacks(hudUpdater)
         uiHandler.post(hudUpdater)
-        if (!romLoaded) {
+        if (!romLoaded && surfaceReady) {
             tryAutoLoadRom()
         }
     }
@@ -242,14 +542,23 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
+        surfaceReady = true
         NativeBridge.nativeSetSurface(holder.surface)
+        if (!romLoaded) {
+            tryAutoLoadRom()
+        }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        surfaceReady = true
         NativeBridge.nativeSetSurface(holder.surface)
+        if (!romLoaded) {
+            tryAutoLoadRom()
+        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        surfaceReady = false
         NativeBridge.nativeSetSurface(null)
     }
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -9,7 +10,7 @@
 namespace ct2::vk {
 
 // Bump whenever HLSL specialization / shader lowering changes so stale SPIR-V is regenerated.
-constexpr uint32_t kShaderCacheVersion = 2;
+constexpr uint32_t kShaderCacheVersion = 3;
 
 struct PsoKey {
     uint64_t vs_hash = 0;
@@ -18,8 +19,6 @@ struct PsoKey {
     uint32_t blend_state = 0;
     uint32_t depth_stencil_state = 0;
     uint32_t raster_state = 0;
-    // Note: topology & vertex stride are dynamic (VK_EXT_extended_dynamic_state / VK 1.3)
-    // and intentionally excluded from PsoKey to drastically reduce pipeline permutations.
 
     bool operator==(const PsoKey& o) const {
         return vs_hash == o.vs_hash && ps_hash == o.ps_hash &&
@@ -60,13 +59,10 @@ public:
     bool LoadSpirv(uint64_t source_hash, std::vector<uint32_t>& out_words) const;
     bool SaveSpirvAtomic(uint64_t source_hash, const std::vector<uint32_t>& words) const;
 
-    // Append-only preload.bin recording (always active, even when boot preloading is toggled off).
     void RecordShaderForPreload(uint64_t shader_key, uint64_t source_hash);
     void RecordPsoForPreload(const PsoKey& key);
     PreloadManifest LoadPreloadManifest() const;
 
-    // Coordination between render thread and detached preloader worker:
-    // returns true if caller claimed ownership of building this PSO key.
     bool ClaimPsoBuild(const PsoKey& key);
 
     const std::string& CacheDir() const { return cache_dir_; }
@@ -85,3 +81,21 @@ private:
 };
 
 } // namespace ct2::vk
+
+#ifdef CT3_ENABLE_XBE_SDK
+// Bindings, one descriptor set: b0 and b1 at 0 and 1, t0 to t3 at 2 to 5, s0 to s3 at 6 to 9.
+namespace vkshader {
+
+constexpr uint32_t kBindingConstants = 0; // b0
+constexpr uint32_t kBindingTextures = 2;  // t0
+constexpr uint32_t kBindingSamplers = 6;  // s0
+constexpr uint32_t kBindings = 10;
+
+enum class Stage { Vertex, Pixel };
+
+void Init(const std::filesystem::path& cache_dir);
+bool Compile(const std::string& hlsl, const char* entry, Stage stage, uint64_t hash, std::vector<uint32_t>& spirv);
+bool Cached(uint64_t hash, std::vector<uint32_t>& spirv);
+
+} // namespace vkshader
+#endif // CT3_ENABLE_XBE_SDK
