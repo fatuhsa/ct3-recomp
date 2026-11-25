@@ -190,12 +190,15 @@ std::thread g_audio_thread;
 
 void Ct3OnLoaded() {
     // The 4 GB guest reservation is PROT_NONE until mem::Commit is called, but
-    // Crazy Taxi 3 touches user pages it never explicitly committed (the device
-    // tombstone shows a write to guest VA 0x06D92100 -> SIGSEGV/SEGV_ACCERR in
-    // sub_0005E420). Make the whole user range writable; the kernel still
-    // allocates physical pages lazily, so this costs no RAM up front.
-    mem::Commit(mem::kUserLow, mem::kUserHigh - mem::kUserLow);
-    ct2::log::Info("CT3Boot", "guest user VA 0x%08X..0x%08X committed for lazy touches", mem::kUserLow, mem::kUserHigh);
+    // Crazy Taxi 3 touches user pages it never explicitly committed. The first
+    // device tombstone showed a write to guest VA 0x06D92100; after committing
+    // 0x00010000..0x7FFE0000 the next tombstone showed a NULL pointer deref at
+    // guest VA 0x00000000 in sub_000F4D20 (a VM opcode reading [x1, x9] with
+    // x9 == 0). Commit from VA 0 as well so the zero page behaves like a
+    // zero-filled null object instead of SIGSEGV/SEGV_ACCERR. Physical pages are
+    // still demand-allocated, so this costs no RAM up front.
+    mem::Commit(0, mem::kUserHigh);
+    ct2::log::Info("CT3Boot", "guest user VA 0x00000000..0x%08X committed for lazy touches", mem::kUserHigh);
 
     // Map Xbox Utility Cache Drive Z:\ before Crazy Taxi 3 caches Media assets
     ::kernel::CreateSymbolicLink("\\??\\Z:", "\\Device\\Harddisk0\\Partition5");
