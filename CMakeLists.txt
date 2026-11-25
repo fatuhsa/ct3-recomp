@@ -179,6 +179,9 @@ find_package(Threads REQUIRED)
 target_link_libraries(main PRIVATE Threads::Threads)
 
 if(ANDROID)
+    # The portable backend creates its VkSurfaceKHR from ANativeWindow directly.
+    target_compile_definitions(main PRIVATE VK_USE_PLATFORM_ANDROID_KHR=1)
+
     find_library(ANDROID_LIB android REQUIRED)
     find_library(LOG_LIB log REQUIRED)
     find_library(AAUDIO_LIB aaudio REQUIRED)

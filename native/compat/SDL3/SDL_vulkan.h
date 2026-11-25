@@ -18,7 +18,7 @@ inline const char* const* SDL_Vulkan_GetInstanceExtensions(uint32_t* count) {
         VK_KHR_SURFACE_EXTENSION_NAME,
         VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
     };
-    if (count) *count = uint32_t(std::size(kExtensions));
+    if (count) *count = uint32_t(sizeof(kExtensions) / sizeof(kExtensions[0]));
     return kExtensions;
 }
 
