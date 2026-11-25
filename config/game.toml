@@ -1,0 +1,53 @@
+# Recompiler input for Crazy Taxi 3: High Roller (USA), Original Xbox
+# Compatible directly with TGP482/XboxXBERecomp (`xbe_recomp`):
+#   xbe_recomp config/game.toml assets/default.xbe generated/game --xdk config/xdk
+#
+# Verified from default.xbe inside "Crazy Taxi 3 - High Roller (USA).iso":
+#   Size:    2,179,072 bytes
+#   SHA-1:   10096ce907b92a702b52e4ccb3cf15ac167ccb6f
+#   SHA-256: eceb4aa071ce9b883566decd70c9ff3c3853003a0bbb4099972232c4edbdb87c
+#   TitleID: 0x53450004 ("CRAZY TAXI 3 High Roller", Region 0x00000001 USA)
+#   XDK:     1.0.4531 (XAPILIB, D3D8, XGRAPHC, DSOUND, XBOXKRNL, LIBCMT)
+
+[xbe]
+path = "assets/default.xbe"
+library = "CrazyTaxi3.dll"
+title = 0x53450004
+entry = 0x000E0C34
+xdk = 4531
+out = "generated/game"
+partitions = 128
+code_sections = [".text", "PSGSFD00", "PSGSFD_I", "D3D", "XGRPH", "DSOUND", "XPP"]
+
+# Extra manually discovered entry points
+[functions]
+
+# XDK 4531 library functions replaced by the native host runtime.
+# Resolve addresses against D3D (0x000F3800), DSOUND (0x001059E0), and XPP (0x00123440).
+[symbols]
+Direct3D_CreateDevice                    = 0
+D3DDevice_Reset                          = 0
+D3DDevice_Swap                           = 0
+D3DDevice_Clear                          = 0
+D3DDevice_BeginPush                      = 0
+D3DDevice_EndPush                        = 0
+D3DDevice_SetTexture                     = 0
+D3DDevice_SetPalette                     = 0
+D3DDevice_SetRenderTarget                = 0
+D3DDevice_SetRenderState                 = 0
+D3DDevice_SetTextureStageStateNotInline  = 0
+D3DDevice_SetTransform                   = 0
+D3DDevice_SetViewport                    = 0
+D3DDevice_SetVertexShader                = 0
+D3DDevice_SetPixelShader                 = 0
+D3DDevice_SetStreamSource                = 0
+D3DDevice_SetIndices                     = 0
+D3DDevice_DrawIndexedVertices            = 0
+D3DDevice_DrawVertices                   = 0
+D3DDevice_LoadVertexShaderProgram        = 0
+D3DDevice_IsBusy                         = 0
+D3DDevice_BlockUntilVerticalBlank        = 0
+CDevice_KickOff                          = 0
+D3D_BlockOnResource                      = 0
+
+[data]

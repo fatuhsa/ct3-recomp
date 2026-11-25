@@ -1,0 +1,180 @@
+name: Android ARM64 Vulkan CI (Crazy Taxi 3 XBE)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      profile_debuggable:
+        description: "Build Release APK with -Pdebuggable for unrooted simpleperf profiling"
+        required: false
+        type: boolean
+        default: false
+      run_xbe_recomp:
+        description: "Require TGP482/XboxXBERecomp lifting of ci/default.xbe.enc (needs XBE_KEY secret)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lift-xbe-recomp:
+    name: Lift Crazy Taxi 3 default.xbe (XboxXBERecomp)
+    runs-on: ubuntu-24.04
+    env:
+      CT3_XBE_SHA1: 10096ce907b92a702b52e4ccb3cf15ac167ccb6f
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Decrypt & lift default.xbe via TGP482/XboxXBERecomp
+        shell: bash
+        env:
+          XBE_KEY: ${{ secrets.XBE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ ! -f ci/default.xbe.enc || -z "${XBE_KEY}" ]]; then
+            if [[ "${{ inputs.run_xbe_recomp }}" == "true" ]]; then
+              echo "::error::run_xbe_recomp=true requires ci/default.xbe.enc and the XBE_KEY repository secret."
+              exit 1
+            fi
+            echo "Skipping XBE lifting (ci/default.xbe.enc or XBE_KEY not set)."
+            exit 0
+          fi
+
+          mkdir -p assets generated/game
+          KEY_FILE="${RUNNER_TEMP}/xbe.key"
+          printf '%s' "$XBE_KEY" | tr -d '\r\n' > "$KEY_FILE"
+          openssl enc -d -aes-256-cbc -md sha256 -pbkdf2 -iter 200000 \
+            -in ci/default.xbe.enc -out assets/default.xbe -pass "file:${KEY_FILE}"
+          rm -f "$KEY_FILE"
+
+          SHA="$(sha1sum assets/default.xbe | awk '{print $1}')"
+          echo "Decrypted default.xbe SHA-1: $SHA"
+          if [[ "$SHA" != "$CT3_XBE_SHA1" ]]; then
+            echo "::error::Unexpected default.xbe SHA-1 ($SHA != $CT3_XBE_SHA1)"
+            exit 1
+          fi
+
+          git clone --depth 1 https://github.com/TGP482/XboxXBERecomp.git sdk
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang ninja-build
+
+          mkdir -p "${RUNNER_TEMP}/recomp_src"
+          cat << 'EOF' > "${RUNNER_TEMP}/recomp_src/CMakeLists.txt"
+          cmake_minimum_required(VERSION 3.22)
+          project(xbe_recomp_host LANGUAGES C CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          include(FetchContent)
+          set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+          set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+          set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+          FetchContent_Declare(zydis GIT_REPOSITORY https://github.com/zyantific/zydis.git GIT_TAG v4.1.1 GIT_SHALLOW TRUE)
+          FetchContent_Declare(tomlplusplus GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git GIT_TAG v3.4.0 GIT_SHALLOW TRUE)
+          FetchContent_MakeAvailable(zydis tomlplusplus)
+          file(GLOB RECOMP_SRCS CONFIGURE_DEPENDS "${SDK_DIR}/tools/recomp/*.cpp")
+          add_executable(xbe_recomp ${RECOMP_SRCS})
+          target_include_directories(xbe_recomp PRIVATE "${SDK_DIR}/runtime" "${SDK_DIR}/tools/recomp")
+          target_link_libraries(xbe_recomp PRIVATE Zydis tomlplusplus::tomlplusplus)
+          EOF
+
+          cmake -S "${RUNNER_TEMP}/recomp_src" -B "${RUNNER_TEMP}/recomp_build" -G Ninja \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release \
+            -DSDK_DIR="${PWD}/sdk"
+          cmake --build "${RUNNER_TEMP}/recomp_build" --target xbe_recomp -j"$(nproc)"
+
+          "${RUNNER_TEMP}/recomp_build/xbe_recomp" \
+            config/game.toml assets/default.xbe generated/game --xdk config/xdk
+
+          PART_COUNT="$(find generated/game -maxdepth 1 -name 'x86_recomp.*.cpp' | wc -l)"
+          echo "Successfully lifted ${PART_COUNT} C++ partitions + x86_func_mapping.cpp"
+          ls -lh generated/game/x86_func_mapping.cpp
+          test "$PART_COUNT" -eq 128
+
+  build-android-arm64:
+    name: Build Android ARM64 APK & Verify 16 KB Alignment
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK, NDK r27b, and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_DIR="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${SDK_DIR}" >> "$GITHUB_ENV"
+          SDKMANAGER="${SDK_DIR}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.1.12297006" \
+            "cmake;3.22.1"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.11.1'
+          cache-provider: basic
+
+      - name: Build Debug & Release APKs (arm64-v8a)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p android assembleDebug --no-daemon --stacktrace
+          RELEASE_ARGS=("assembleRelease" "--no-daemon" "--stacktrace")
+          if [[ "${{ inputs.profile_debuggable }}" == "true" ]]; then
+            RELEASE_ARGS+=("-Pdebuggable")
+          fi
+          gradle -p android "${RELEASE_ARGS[@]}"
+
+      - name: Verify Android 15+ 16 KB ELF LOAD alignment on libmain.so
+        shell: bash
+        run: |
+          set -euo pipefail
+          SO_PATH="$(find android/app/build/intermediates -path '*release*' -name 'libmain.so' | head -n 1)"
+          test -n "$SO_PATH"
+          echo "Inspecting: $SO_PATH"
+          readelf -lW "$SO_PATH"
+          BAD_ALIGN="$(readelf -lW "$SO_PATH" | awk '$1=="LOAD" && $NF !~ /^0x(4000|8000|10000)$/ { print }')"
+          if [[ -n "$BAD_ALIGN" ]]; then
+            echo "ERROR: Found LOAD segment without >=16 KB (0x4000) alignment:"
+            echo "$BAD_ALIGN"
+            exit 1
+          fi
+          echo "OK: All LOAD segments in libmain.so are 16 KB aligned."
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: ct3-recomp-arm64-apks
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload unstripped libmain.so (for simpleperf & hang symbolization)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ct3-recomp-arm64-symbols
+          path: android/app/build/intermediates/cmake/release/obj/arm64-v8a/libmain.so
+          if-no-files-found: warn
+          retention-days: 14

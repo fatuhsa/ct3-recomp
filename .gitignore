@@ -1,0 +1,34 @@
+# Build outputs
+build/
+.cxx/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+
+# Recompiler SDK checkout & generated guest C++ (never commit lifted code or game assets)
+sdk/
+assets/
+generated/
+
+# IDE & OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Runtime caches, ROMs, and logs (never commit copyrighted ROM/XBE images)
+roms/
+shadercache/
+logs/
+saves/
+*.iso
+*.xiso
+*.xbe
+*.chd
+*.gdi
+*.cdi
+*.bin
+*.cue
+*.spv
+*.tmp

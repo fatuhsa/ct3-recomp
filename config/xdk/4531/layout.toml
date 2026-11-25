@@ -1,0 +1,37 @@
+# Initial XDK 4531 D3D8 / DSOUND structure layout baseline for Crazy Taxi 3: High Roller (USA).
+# Passed to `xbe_recomp` via `--xdk config/xdk` (resolves `config/xdk/4531/layout.toml`).
+# Seeded from XboxXBERecomp's nearest XDK 4831 layout; verify each CDevice offset against
+# Crazy Taxi 3's D3D section (VA 0x000F3800 .. 0x00105700) when resolving symbols.
+
+[layout]
+CDevice_Push              = 0x0
+CDevice_PushThreshold     = 0x4
+CDevice_Flags             = 0x8
+CDevice_BaseVertex        = 0x1C
+CDevice_Time              = 0x30
+CDevice_PixelShader       = 0x370
+CDevice_VertexShader      = 0x380
+CDevice_IndexBuffer       = 0x38C
+CDevice_ZScale            = 0x510
+CDevice_SuperSampleX      = 0x518
+CDevice_SuperSampleY      = 0x51C
+CDevice_BackBufferScale   = 0x528
+CDevice_Transforms        = 0x810
+CDevice_Viewport          = 0xA90
+CDevice_ScreenSpaceOffset = 0xAA8
+CDevice_Textures          = 0xB38
+CDevice_Palettes          = 0xB48
+CDevice_RenderTarget      = 0x21B4
+CDevice_Depth             = 0x21B8
+CDevice_BackBuffer        = 0x21C0
+CDevice_FrontBuffer       = 0x21C4
+CDevice_AutoDepth         = 0x21CC
+CDevice_SwapCount         = 0x2C10
+CDevice_Size              = 0x2C30
+
+DirtyFlags_Texture        = 0x4800
+TextureState_Stage        = 32
+Stream_Size               = 12
+Stream_Stride             = 0x0
+Stream_Buffer             = 0x8
+PixelShader_Definition    = 0x8
