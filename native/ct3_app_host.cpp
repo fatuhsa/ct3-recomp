@@ -23,6 +23,7 @@
 #include "core/log.h"
 #include "kernel/exports.h"
 #include "kernel/kernel.h"
+#include "kernel/memory.h"
 #include "xdk/hle.h"
 #endif
 
@@ -188,6 +189,14 @@ std::atomic<bool> g_audio_started{false};
 std::thread g_audio_thread;
 
 void Ct3OnLoaded() {
+    // The 4 GB guest reservation is PROT_NONE until mem::Commit is called, but
+    // Crazy Taxi 3 touches user pages it never explicitly committed (the device
+    // tombstone shows a write to guest VA 0x06D92100 -> SIGSEGV/SEGV_ACCERR in
+    // sub_0005E420). Make the whole user range writable; the kernel still
+    // allocates physical pages lazily, so this costs no RAM up front.
+    mem::Commit(mem::kUserLow, mem::kUserHigh - mem::kUserLow);
+    ct2::log::Info("CT3Boot", "guest user VA 0x%08X..0x%08X committed for lazy touches", mem::kUserLow, mem::kUserHigh);
+
     // Map Xbox Utility Cache Drive Z:\ before Crazy Taxi 3 caches Media assets
     ::kernel::CreateSymbolicLink("\\??\\Z:", "\\Device\\Harddisk0\\Partition5");
     // U: is the console's user save drive. Map it straight to the data partition
