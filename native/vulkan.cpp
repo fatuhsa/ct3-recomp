@@ -5,6 +5,7 @@
 #include "native/stats.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -123,9 +124,19 @@ bool VulkanRenderer::InitVulkanDevice() {
     app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
     app_info.apiVersion = VK_API_VERSION_1_2;
 
+    std::vector<const char*> inst_exts;
+#ifdef VK_KHR_SURFACE_EXTENSION_NAME
+    inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+#endif
+#if defined(__ANDROID__) && defined(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)
+    inst_exts.push_back(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+#endif
+
     VkInstanceCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app_info;
+    ici.enabledExtensionCount = static_cast<uint32_t>(inst_exts.size());
+    ici.ppEnabledExtensionNames = inst_exts.data();
 
     if (vkCreateInstance(&ici, nullptr, &instance_) != VK_SUCCESS) {
         log::Warn("CT2Vk", "vkCreateInstance failed; running headless fallback mode");
@@ -192,6 +203,11 @@ bool VulkanRenderer::InitVulkanDevice() {
 
     // Keep VkDeviceCreateInfo.pNext strictly minimal (VK 1.1 drivers crash on unused feature structs).
     std::vector<const char*> enabled_exts;
+#ifdef VK_KHR_SWAPCHAIN_EXTENSION_NAME
+    if (HasExtension(exts, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
+        enabled_exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    }
+#endif
     void* pnext_head = nullptr;
 
     VkPhysicalDeviceVulkan12Features vk12_feats{};
@@ -272,6 +288,11 @@ bool VulkanRenderer::InitVulkanDevice() {
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         vkCreateFence(device_, &fci, nullptr, &f.fence);
 
+        VkSemaphoreCreateInfo bsci{};
+        bsci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        vkCreateSemaphore(device_, &bsci, nullptr, &f.img_available);
+        vkCreateSemaphore(device_, &bsci, nullptr, &f.render_finished);
+
         VkQueryPoolCreateInfo qpci{};
         qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -309,16 +330,27 @@ void VulkanRenderer::Shutdown() {
     if (!initialized_) return;
     initialized_ = false;
 
+#if CT2_HAS_VULKAN_HEADERS
+    if (device_ != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device_);
+    }
+#endif
     if (preload_worker_.joinable()) preload_worker_.join();
     StopTexPackWorker();
     StopPoolResetWorker();
     SavePipelineCacheAtomic();
 
 #if CT2_HAS_VULKAN_HEADERS
+    {
+        std::lock_guard<std::mutex> slock(swap_mu_);
+        DestroySwapchainLocked();
+    }
     if (device_ != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device_);
         for (auto& f : frames_) {
             if (f.query_pool) vkDestroyQueryPool(device_, f.query_pool, nullptr);
+            if (f.render_finished) vkDestroySemaphore(device_, f.render_finished, nullptr);
+            if (f.img_available) vkDestroySemaphore(device_, f.img_available, nullptr);
             if (f.fence) vkDestroyFence(device_, f.fence, nullptr);
             if (f.pool) vkDestroyCommandPool(device_, f.pool, nullptr);
             f = FrameSlot{};
@@ -335,6 +367,213 @@ void VulkanRenderer::Shutdown() {
 #endif
     textures_.clear();
     total_texture_bytes_ = 0;
+}
+
+void VulkanRenderer::DestroySwapchainLocked() {
+#if CT2_HAS_VULKAN_HEADERS
+    if (device_ != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device_);
+        for (auto fb : swap_framebuffers_) {
+            if (fb) vkDestroyFramebuffer(device_, fb, nullptr);
+        }
+        swap_framebuffers_.clear();
+        for (auto iv : swap_views_) {
+            if (iv) vkDestroyImageView(device_, iv, nullptr);
+        }
+        swap_views_.clear();
+        swap_images_.clear();
+        if (present_render_pass_) {
+            vkDestroyRenderPass(device_, present_render_pass_, nullptr);
+            present_render_pass_ = VK_NULL_HANDLE;
+        }
+        if (swapchain_) {
+            vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+            swapchain_ = VK_NULL_HANDLE;
+        }
+    }
+    if (instance_ != VK_NULL_HANDLE && surface_ != VK_NULL_HANDLE) {
+        vkDestroySurfaceKHR(instance_, surface_, nullptr);
+        surface_ = VK_NULL_HANDLE;
+    }
+#endif
+    swapchain_ready_ = false;
+    swap_width_ = 0;
+    swap_height_ = 0;
+    swap_image_count_ = 0;
+}
+
+bool VulkanRenderer::CreateSwapchainLocked(void* native_window, uint32_t width, uint32_t height) {
+#if CT2_HAS_VULKAN_HEADERS && defined(__ANDROID__)
+    DestroySwapchainLocked();
+    if (!native_window || instance_ == VK_NULL_HANDLE || device_ == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    VkAndroidSurfaceCreateInfoKHR asci{};
+    asci.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
+    asci.window = static_cast<ANativeWindow*>(native_window);
+    if (vkCreateAndroidSurfaceKHR(instance_, &asci, nullptr, &surface_) != VK_SUCCESS) {
+        log::Error("CT2Vk", "vkCreateAndroidSurfaceKHR failed");
+        return false;
+    }
+
+    VkSurfaceCapabilitiesKHR surf_caps{};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys_dev_, surface_, &surf_caps) != VK_SUCCESS) {
+        DestroySwapchainLocked();
+        return false;
+    }
+
+    uint32_t fmt_count = 0;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(phys_dev_, surface_, &fmt_count, nullptr);
+    std::vector<VkSurfaceFormatKHR> fmts(fmt_count);
+    if (fmt_count > 0) {
+        vkGetPhysicalDeviceSurfaceFormatsKHR(phys_dev_, surface_, &fmt_count, fmts.data());
+    }
+    VkSurfaceFormatKHR chosen_fmt{VK_FORMAT_R8G8B8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    for (const auto& sf : fmts) {
+        if (sf.format == VK_FORMAT_R8G8B8A8_UNORM || sf.format == VK_FORMAT_B8G8R8A8_UNORM) {
+            chosen_fmt = sf;
+            break;
+        }
+    }
+    swap_format_ = chosen_fmt.format;
+
+    VkExtent2D extent{};
+    if (surf_caps.currentExtent.width != UINT32_MAX && surf_caps.currentExtent.width > 0) {
+        extent = surf_caps.currentExtent;
+    } else {
+        extent.width = std::clamp(width ? width : 1280u,
+                                  surf_caps.minImageExtent.width, surf_caps.maxImageExtent.width);
+        extent.height = std::clamp(height ? height : 720u,
+                                   surf_caps.minImageExtent.height, surf_caps.maxImageExtent.height);
+    }
+
+    uint32_t img_count = std::max(surf_caps.minImageCount + 1, 3u);
+    if (surf_caps.maxImageCount > 0 && img_count > surf_caps.maxImageCount) {
+        img_count = surf_caps.maxImageCount;
+    }
+
+    VkCompositeAlphaFlagBitsKHR comp_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if (!(surf_caps.supportedCompositeAlpha & comp_alpha)) {
+        comp_alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    }
+
+    VkSwapchainCreateInfoKHR sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    sci.surface = surface_;
+    sci.minImageCount = img_count;
+    sci.imageFormat = chosen_fmt.format;
+    sci.imageColorSpace = chosen_fmt.colorSpace;
+    sci.imageExtent = extent;
+    sci.imageArrayLayers = 1;
+    sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    sci.preTransform = surf_caps.currentTransform;
+    sci.compositeAlpha = comp_alpha;
+    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    sci.clipped = VK_TRUE;
+
+    if (vkCreateSwapchainKHR(device_, &sci, nullptr, &swapchain_) != VK_SUCCESS) {
+        log::Error("CT2Vk", "vkCreateSwapchainKHR failed");
+        DestroySwapchainLocked();
+        return false;
+    }
+
+    uint32_t actual_imgs = 0;
+    vkGetSwapchainImagesKHR(device_, swapchain_, &actual_imgs, nullptr);
+    swap_images_.resize(actual_imgs);
+    vkGetSwapchainImagesKHR(device_, swapchain_, &actual_imgs, swap_images_.data());
+
+    // Cached VkRenderPass (Adreno-friendly, deferred LOAD_OP_CLEAR)
+    VkAttachmentDescription color_att{};
+    color_att.format = swap_format_;
+    color_att.samples = VK_SAMPLE_COUNT_1_BIT;
+    color_att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color_att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color_att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color_att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color_att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    color_att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkAttachmentReference color_ref{};
+    color_ref.attachment = 0;
+    color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &color_ref;
+
+    VkRenderPassCreateInfo rpci{};
+    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &color_att;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &subpass;
+    if (vkCreateRenderPass(device_, &rpci, nullptr, &present_render_pass_) != VK_SUCCESS) {
+        DestroySwapchainLocked();
+        return false;
+    }
+
+    swap_views_.resize(actual_imgs, VK_NULL_HANDLE);
+    swap_framebuffers_.resize(actual_imgs, VK_NULL_HANDLE);
+    for (uint32_t i = 0; i < actual_imgs; ++i) {
+        VkImageViewCreateInfo ivci{};
+        ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ivci.image = swap_images_[i];
+        ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ivci.format = swap_format_;
+        ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ivci.subresourceRange.levelCount = 1;
+        ivci.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(device_, &ivci, nullptr, &swap_views_[i]) != VK_SUCCESS) {
+            DestroySwapchainLocked();
+            return false;
+        }
+
+        VkFramebufferCreateInfo fbci{};
+        fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbci.renderPass = present_render_pass_;
+        fbci.attachmentCount = 1;
+        fbci.pAttachments = &swap_views_[i];
+        fbci.width = extent.width;
+        fbci.height = extent.height;
+        fbci.layers = 1;
+        if (vkCreateFramebuffer(device_, &fbci, nullptr, &swap_framebuffers_[i]) != VK_SUCCESS) {
+            DestroySwapchainLocked();
+            return false;
+        }
+    }
+
+    swap_width_ = extent.width;
+    swap_height_ = extent.height;
+    swap_image_count_ = actual_imgs;
+    swapchain_ready_ = true;
+    swapchain_dirty_ = false;
+    RetireImageView();
+    log::Info("CT2Vk", "Swapchain ready: %ux%u (%u images, cached VkRenderPass)",
+              swap_width_, swap_height_, swap_image_count_);
+    return true;
+#else
+    (void)native_window;
+    (void)width;
+    (void)height;
+    return false;
+#endif
+}
+
+void VulkanRenderer::SetNativeWindow(void* native_window, uint32_t width, uint32_t height) {
+    std::lock_guard<std::mutex> slock(swap_mu_);
+    pending_window_ = native_window;
+    cfg_.native_window = native_window;
+    cfg_.width = width;
+    cfg_.height = height;
+    if (!native_window) {
+        DestroySwapchainLocked();
+    } else {
+        swapchain_dirty_ = true;
+        CreateSwapchainLocked(native_window, width, height);
+    }
 }
 
 void VulkanRenderer::Resize(uint32_t width, uint32_t height, uint32_t scale_pct) {
@@ -797,8 +1036,132 @@ void VulkanRenderer::ExecutePresent() {
         ReleaseOldTextures();
     }
 
+#if CT2_HAS_VULKAN_HEADERS && defined(__ANDROID__)
+    {
+        std::lock_guard<std::mutex> slock(swap_mu_);
+        if (swapchain_dirty_ && pending_window_) {
+            CreateSwapchainLocked(pending_window_, cfg_.width, cfg_.height);
+        }
+
+        if (swapchain_ready_ && device_ != VK_NULL_HANDLE && swapchain_ != VK_NULL_HANDLE) {
+            // Wait for this frame slot's previous GPU submission before reading timestamps / reusing cmd buffer.
+            vkWaitForFences(device_, 1, &frame.fence, VK_TRUE, UINT64_MAX);
+            if (frame.has_timestamp_query && frame.query_pool != VK_NULL_HANDLE) {
+                uint64_t ts[2]{0, 0};
+                if (vkGetQueryPoolResults(device_, frame.query_pool, 0, 2, sizeof(ts), ts,
+                                          sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+                    ts[1] >= ts[0]) {
+                    const double gpu_ms =
+                        static_cast<double>(ts[1] - ts[0]) * caps_.timestamp_period_ns * 1e-6;
+                    diag::RecordGpuFrameMs(gpu_ms);
+                    diag::RecordGpuPassMs("SwapPresent", gpu_ms);
+                }
+                frame.has_timestamp_query = false;
+            }
+
+            uint32_t img_idx = 0;
+            const VkResult acq = vkAcquireNextImageKHR(
+                device_, swapchain_, UINT64_MAX, frame.img_available, VK_NULL_HANDLE, &img_idx);
+            if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
+                swapchain_dirty_ = true;
+            } else if (acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR) {
+                if (acq == VK_SUBOPTIMAL_KHR) swapchain_dirty_ = true;
+
+                vkResetFences(device_, 1, &frame.fence);
+                if (!reset_running_.load(std::memory_order_acquire)) {
+                    vkResetCommandPool(device_, frame.pool, 0);
+                }
+
+                VkCommandBufferBeginInfo cbbi{};
+                cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(frame.cmd, &cbbi);
+
+                if (frame.query_pool != VK_NULL_HANDLE) {
+                    vkCmdResetQueryPool(frame.cmd, frame.query_pool, 0, 2);
+                    vkCmdWriteTimestamp(frame.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                        frame.query_pool, 0);
+                }
+
+                // Live Crazy Taxi diagnostic pulse (Taxi Yellow <-> Deep Navy) until lifted game draws
+                const float pulse = 0.5f + 0.5f * std::sin(static_cast<float>(present_count_) * 0.04f);
+                VkClearValue clear_val{};
+                clear_val.color.float32[0] = 0.08f + 0.85f * pulse;
+                clear_val.color.float32[1] = 0.12f + 0.62f * pulse;
+                clear_val.color.float32[2] = 0.22f - 0.14f * pulse;
+                clear_val.color.float32[3] = 1.0f;
+
+                VkRenderPassBeginInfo rpbi{};
+                rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                rpbi.renderPass = present_render_pass_;
+                rpbi.framebuffer = swap_framebuffers_[img_idx];
+                rpbi.renderArea.extent = {swap_width_, swap_height_};
+                rpbi.clearValueCount = 1;
+                rpbi.pClearValues = &clear_val;
+                vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+                vkCmdEndRenderPass(frame.cmd);
+
+                if (frame.query_pool != VK_NULL_HANDLE) {
+                    vkCmdWriteTimestamp(frame.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                        frame.query_pool, 1);
+                    frame.has_timestamp_query = true;
+                }
+                vkEndCommandBuffer(frame.cmd);
+
+                const VkPipelineStageFlags wait_stage =
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                frame.timeline_value = ++timeline_counter_;
+
+                VkSemaphore sig_sems[2] = {frame.render_finished, timeline_sem_};
+                uint64_t wait_vals[1] = {0};
+                uint64_t sig_vals[2] = {0, frame.timeline_value};
+
+                VkTimelineSemaphoreSubmitInfo tssi{};
+                tssi.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+                tssi.waitSemaphoreValueCount = 1;
+                tssi.pWaitSemaphoreValues = wait_vals;
+                tssi.signalSemaphoreValueCount = 2;
+                tssi.pSignalSemaphoreValues = sig_vals;
+
+                VkSubmitInfo si{};
+                si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                si.waitSemaphoreCount = 1;
+                si.pWaitSemaphores = &frame.img_available;
+                si.pWaitDstStageMask = &wait_stage;
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &frame.cmd;
+                if (caps_.use_timeline_semaphores && timeline_sem_ != VK_NULL_HANDLE) {
+                    si.pNext = &tssi;
+                    si.signalSemaphoreCount = 2;
+                    si.pSignalSemaphores = sig_sems;
+                } else {
+                    si.signalSemaphoreCount = 1;
+                    si.pSignalSemaphores = &frame.render_finished;
+                }
+
+                if (vkQueueSubmit(queue_, 1, &si, frame.fence) == VK_SUCCESS) {
+                    VkPresentInfoKHR pi{};
+                    pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+                    pi.waitSemaphoreCount = 1;
+                    pi.pWaitSemaphores = &frame.render_finished;
+                    pi.swapchainCount = 1;
+                    pi.pSwapchains = &swapchain_;
+                    pi.pImageIndices = &img_idx;
+                    const VkResult pres = vkQueuePresentKHR(queue_, &pi);
+                    if (pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR) {
+                        swapchain_dirty_ = true;
+                    }
+                    if (caps_.use_timeline_semaphores) {
+                        QueuePoolReset(current_frame_);
+                    }
+                }
+            }
+        }
+    }
+#else
     frame.timeline_value = ++timeline_counter_;
     QueuePoolReset(current_frame_);
+#endif
 
     current_frame_ = (current_frame_ + 1) % kFramesInFlight;
     AwaitPoolReset(current_frame_);

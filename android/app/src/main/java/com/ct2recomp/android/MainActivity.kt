@@ -8,11 +8,15 @@ import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.graphics.Typeface
 import android.util.Log
 import android.view.Gravity
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
@@ -28,9 +32,19 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     }
 
     private lateinit var surfaceView: SurfaceView
+    private var hudText: TextView? = null
     private var romOverlay: LinearLayout? = null
     private var statusText: TextView? = null
     private var romLoaded = false
+
+    // 1 Hz UI-thread telemetry HUD updater (zero per-frame JNI calls).
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val hudUpdater = object : Runnable {
+        override fun run() {
+            hudText?.text = NativeBridge.nativeGetDiagStatus()
+            uiHandler.postDelayed(this, 1000L)
+        }
+    }
 
     private val pickRomLauncher =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
@@ -80,6 +94,26 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             holder.addCallback(this@MainActivity)
         }
         root.addView(surfaceView)
+
+        val hud = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(0xFFFFFFFF.toInt())
+            setBackgroundColor(0x99000000.toInt())
+            setPadding(20, 16, 20, 16)
+            text = "Initializing Vulkan + Crazy Taxi 3 XBE runtime..."
+        }
+        hudText = hud
+        root.addView(
+            hud,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.START
+            ).apply {
+                setMargins(16, 16, 16, 16)
+            }
+        )
 
         val overlay = buildRomOverlay()
         romOverlay = overlay
@@ -184,12 +218,15 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     override fun onResume() {
         super.onResume()
         NativeBridge.nativeSetForeground(true)
+        uiHandler.removeCallbacks(hudUpdater)
+        uiHandler.post(hudUpdater)
         if (!romLoaded) {
             tryAutoLoadRom()
         }
     }
 
     override fun onPause() {
+        uiHandler.removeCallbacks(hudUpdater)
         NativeBridge.nativeSetForeground(false)
         super.onPause()
     }

@@ -14,6 +14,7 @@
 #include "recomp/x86_context.h"
 
 #include <atomic>
+#include <cstdio>
 #include <jni.h>
 #include <memory>
 #include <mutex>
@@ -185,19 +186,62 @@ JNIEXPORT void JNICALL
 Java_com_ct2recomp_android_NativeBridge_nativeSetSurface(JNIEnv* env, jclass, jobject surface) {
     std::lock_guard<std::mutex> lock(g_rt.mu);
     if (g_rt.window) {
+        g_rt.renderer.SetNativeWindow(nullptr, 0, 0);
         ANativeWindow_release(g_rt.window);
         g_rt.window = nullptr;
     }
     if (surface) {
         g_rt.window = ANativeWindow_fromSurface(env, surface);
         if (g_rt.window) {
-            g_rt.renderer.Resize(
-                static_cast<uint32_t>(ANativeWindow_getWidth(g_rt.window)),
-                static_cast<uint32_t>(ANativeWindow_getHeight(g_rt.window)),
-                g_rt.dyn_res.CurrentPercent());
+            const uint32_t w = static_cast<uint32_t>(ANativeWindow_getWidth(g_rt.window));
+            const uint32_t h = static_cast<uint32_t>(ANativeWindow_getHeight(g_rt.window));
+            g_rt.renderer.SetNativeWindow(g_rt.window, w, h);
+            g_rt.renderer.Resize(w, h, g_rt.dyn_res.CurrentPercent());
         }
     }
     ClearJniException(env, "nativeSetSurface");
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_ct2recomp_android_NativeBridge_nativeGetDiagStatus(JNIEnv* env, jclass) {
+    const auto& caps = g_rt.renderer.Caps();
+    const auto snap = ct2::diag::LatestSnapshot();
+    const uint32_t api_maj = (caps.api_version >> 22) & 0x7Fu;
+    const uint32_t api_min = (caps.api_version >> 12) & 0x3FFu;
+
+    const char* vendor_tag = caps.is_adreno ? "Adreno" : (caps.is_mali ? "Mali" : "Other");
+    char buf[1024];
+    std::snprintf(
+        buf, sizeof(buf),
+        "CT3 XBE Vulkan Diag (Scaffold -> Swapchain Active)\n"
+        "GPU: %s (%s 0x%04X) | VK %u.%u\n"
+        "Quirks: dynRender=%s | timeline=%s | extDyn=%s | BC=%s\n"
+        "Swapchain: %s (%ux%u, %u imgs) | Presents: %llu\n"
+        "ROM: %s | XISO files: %zu\n"
+        "XBE: %s | TitleID: 0x%08X | Entry: 0x%08X | Thunks: %zu\n"
+        "Perf: %.1f FPS | title %.2fms | render %.2fms | gpu %.2fms\n"
+        "Sys: CPU %.0f%% | GPU %.0f%% | Bat %.1fC | DynRes %u%%",
+        caps.device_name.empty() ? "Unknown" : caps.device_name.c_str(),
+        vendor_tag, caps.vendor_id, api_maj, api_min,
+        caps.use_dynamic_rendering ? "ON" : "OFF(cachedRP)",
+        caps.use_timeline_semaphores ? "VK1.2" : "VkFence",
+        caps.use_extended_dynamic_state ? "ON" : "OFF",
+        caps.supports_bc ? "HW" : "CPU-Cap384M",
+        g_rt.renderer.SwapchainReady() ? "OK" : "WAIT",
+        g_rt.renderer.SwapchainWidth(), g_rt.renderer.SwapchainHeight(),
+        g_rt.renderer.SwapchainImageCount(),
+        static_cast<unsigned long long>(g_rt.renderer.PresentCount()),
+        g_rt.rom.IsOpen() ? g_rt.rom.Info().display_name.c_str() : "Not loaded",
+        g_rt.rom.Xiso().FileCount(),
+        g_rt.xbe_info.title_name.empty() ? "Pending" : g_rt.xbe_info.title_name.c_str(),
+        g_rt.xbe_info.title_id, g_rt.xbe_info.entry_point, g_rt.kernel.BoundThunkCount(),
+        snap.fps, snap.title_ms, snap.render_ms, snap.gpu_ms,
+        snap.cpu_load_pct, snap.gpu_load_pct, snap.battery_temp_c,
+        g_rt.dyn_res.CurrentPercent());
+
+    jstring res = env->NewStringUTF(buf);
+    ClearJniException(env, "nativeGetDiagStatus");
+    return res;
 }
 
 JNIEXPORT void JNICALL

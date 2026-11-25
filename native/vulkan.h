@@ -17,6 +17,9 @@
 
 #if __has_include(<vulkan/vulkan.h>)
 #define CT2_HAS_VULKAN_HEADERS 1
+#if defined(__ANDROID__) && !defined(VK_USE_PLATFORM_ANDROID_KHR)
+#define VK_USE_PLATFORM_ANDROID_KHR 1
+#endif
 #include <vulkan/vulkan.h>
 #else
 #define CT2_HAS_VULKAN_HEADERS 0
@@ -109,6 +112,7 @@ public:
     bool Initialize(const RendererConfig& cfg);
     void Shutdown();
 
+    void SetNativeWindow(void* native_window, uint32_t width, uint32_t height);
     void Resize(uint32_t width, uint32_t height, uint32_t scale_pct);
     void ReplayBatch(const gfx::CmdBatch& batch, const uint8_t* header_ring);
 
@@ -120,6 +124,11 @@ public:
 
     const GpuCaps& Caps() const { return caps_; }
     uint64_t TotalTextureBytes() const { return total_texture_bytes_; }
+    uint64_t PresentCount() const { return present_count_; }
+    bool SwapchainReady() const { return swapchain_ready_; }
+    uint32_t SwapchainWidth() const { return swap_width_; }
+    uint32_t SwapchainHeight() const { return swap_height_; }
+    uint32_t SwapchainImageCount() const { return swap_image_count_; }
 
 private:
     struct FrameSlot {
@@ -133,7 +142,10 @@ private:
         VkCommandPool pool = VK_NULL_HANDLE;
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        VkSemaphore img_available = VK_NULL_HANDLE;
+        VkSemaphore render_finished = VK_NULL_HANDLE;
         VkQueryPool query_pool = VK_NULL_HANDLE;
+        bool has_timestamp_query = false;
         VkBuffer upload_buf = VK_NULL_HANDLE;
         VkDeviceMemory upload_mem = VK_NULL_HANDLE;
         void* upload_mapped = nullptr;
@@ -144,6 +156,8 @@ private:
     };
 
     bool InitVulkanDevice();
+    bool CreateSwapchainLocked(void* native_window, uint32_t width, uint32_t height);
+    void DestroySwapchainLocked();
     void SelectMobileQuirks(uint32_t vendor_id, uint32_t api_version,
                             bool has_dyn_render_ext, bool has_ext_dyn_state);
 
@@ -210,7 +224,14 @@ private:
     std::thread texpack_worker_;
 
     std::thread preload_worker_;
+    std::mutex swap_mu_;
     bool initialized_ = false;
+    bool swapchain_ready_ = false;
+    bool swapchain_dirty_ = false;
+    uint32_t swap_width_ = 0;
+    uint32_t swap_height_ = 0;
+    uint32_t swap_image_count_ = 0;
+    void* pending_window_ = nullptr;
 
 #if CT2_HAS_VULKAN_HEADERS
     VkInstance instance_ = VK_NULL_HANDLE;
@@ -221,6 +242,14 @@ private:
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     VkSemaphore timeline_sem_ = VK_NULL_HANDLE;
     PFN_vkWaitSemaphores pfn_vkWaitSemaphores_ = nullptr;
+
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
+    VkFormat swap_format_ = VK_FORMAT_R8G8B8A8_UNORM;
+    VkRenderPass present_render_pass_ = VK_NULL_HANDLE;
+    std::vector<VkImage> swap_images_;
+    std::vector<VkImageView> swap_views_;
+    std::vector<VkFramebuffer> swap_framebuffers_;
 #endif
 };
 

@@ -13,6 +13,7 @@ object NativeBridge {
     external fun nativeSetSurface(surface: Surface?)
     external fun nativeSetBatteryTempC(tempC: Float)
     external fun nativeSetForeground(foreground: Boolean)
+    external fun nativeGetDiagStatus(): String
     external fun nativeSetGraphicsSwitches(
         reflectionCadence: Int,
         roadReflections: Boolean,
