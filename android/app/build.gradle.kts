@@ -1,12 +1,9 @@
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
 }
 
 // Pass -Pdebuggable on Release builds for unrooted simpleperf profiling with -O2 native code:
-//   ./gradlew assembleRelease -Pdebuggable
+//   gradle -p android assembleRelease -Pdebuggable
 val isProfileDebuggable = project.hasProperty("debuggable")
 
 android {
@@ -81,12 +78,6 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-}
-
-kotlin {
-    compilerOptions {
-        jvmTarget.set(JvmTarget.JVM_17)
     }
 }
 
