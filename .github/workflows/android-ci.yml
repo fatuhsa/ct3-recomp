@@ -68,6 +68,10 @@ jobs:
           mv "${RUNNER_TEMP}/mw_sdk/sdk" ./sdk
           rm -rf "${RUNNER_TEMP}/mw_sdk"
 
+          # Patch kernel::Disc::Open so Android SAF "/proc/self/fd/<N>" uses dup(N) instead of SELinux-blocked open()
+          perl -0777 -i -pe 's/file_ = open\(path\.c_str\(\), O_RDONLY\);/if (path.string().rfind("\/proc\/self\/fd\/", 0) == 0) { file_ = dup(std::stoi(path.string().substr(14))); } else { file_ = open(path.c_str(), O_RDONLY); }/' sdk/runtime/kernel/disc.cpp
+          grep -n "proc/self/fd" sdk/runtime/kernel/disc.cpp
+
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang ninja-build
 

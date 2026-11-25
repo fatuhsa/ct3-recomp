@@ -16,6 +16,7 @@
 #include "audio/audio.h"
 #include "core/input.h"
 #include "core/log.h"
+#include "kernel/kernel.h"
 #endif
 
 namespace ct2::sdk_bridge {
@@ -63,7 +64,9 @@ std::atomic<bool> g_audio_started{false};
 std::thread g_audio_thread;
 
 void Ct3OnLoaded() {
-    ct2::log::Info("CT3Boot", "Crazy Taxi 3 XBE image mapped into guest RAM (entry=0x000E0C34)");
+    // Ensure Xbox Utility Cache Drive Z:\ is mapped before Crazy Taxi 3 caches Media assets
+    ::kernel::CreateSymbolicLink("\\??\\Z:", "\\Device\\Harddisk0\\Partition5");
+    ct2::log::Info("CT3Boot", "Crazy Taxi 3 XBE image mapped into guest RAM (entry=0x000E0C34, Z: linked)");
 }
 
 void Ct3PadHook(int port, input::Pad& pad) {
