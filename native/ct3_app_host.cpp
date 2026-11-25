@@ -190,13 +190,13 @@ std::thread g_audio_thread;
 void Ct3OnLoaded() {
     // Map Xbox Utility Cache Drive Z:\ before Crazy Taxi 3 caches Media assets
     ::kernel::CreateSymbolicLink("\\??\\Z:", "\\Device\\Harddisk0\\Partition5");
-    // U: and T: are XAPI's save links into Harddisk0\Partition1 (the E: data
-    // partition): UDATA for player saves, TDATA for title data. Crazy Taxi 3 probes
-    // U:\<title-id>\SaveMeta.xbx at boot; without these links every save or
-    // options write fails with "no mapping for U:\...".
-    ::kernel::CreateSymbolicLink("\\??\\U:", "\\Device\\Harddisk0\\Partition1\\UDATA");
-    ::kernel::CreateSymbolicLink("\\??\\T:", "\\Device\\Harddisk0\\Partition1\\TDATA");
-    ct2::log::Info("CT3Boot", "Crazy Taxi 3 XBE mapped (entry=0x000E0C34, Z:, U: and T: linked)");
+    // U: is the console's user save drive. Map it straight to the data partition
+    // (E:): the canonical UDATA/TDATA split made Crazy Taxi 3 crash on a real
+    // Mali-G57 device right after D3D init, so keep the mapping that was verified
+    // to boot cleanly on-device. T: is deliberately left unmapped for the same
+    // reason.
+    ::kernel::CreateSymbolicLink("\\??\\U:", "\\Device\\Harddisk0\\Partition1");
+    ct2::log::Info("CT3Boot", "Crazy Taxi 3 XBE mapped (entry=0x000E0C34, Z: and U: linked)");
 }
 
 void Ct3PadHook(int port, input::Pad& pad) {
