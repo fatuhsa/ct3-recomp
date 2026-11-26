@@ -312,24 +312,43 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             }
         )
 
-        // Bottom-right: Crazy Taxi pedals (BRAKE LT / GAS RT) + action buttons (A/B/X/Y)
+        // Bottom-right: Classic Xbox ABXY diamond + BRAKE (LT) / GAS (RT) pedals
         val rightCluster = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.END
+            gravity = Gravity.CENTER_HORIZONTAL
         }
-        val abxyTop = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        abxyTop.addView(makePadButton("X", 0x66554422, 62, 46) { down -> touchX = if (down) 255 else 0 })
-        abxyTop.addView(makePadButton("Y (HOP)", 0x66225588, 72, 46) { down -> touchY = if (down) 255 else 0 })
+        val abxyTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        abxyTop.addView(makePadButton("Y", 0x66998811, 56, 48) { down -> touchY = if (down) 255 else 0 })
 
-        val abxyBot = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        abxyBot.addView(makePadButton("A (REV)", 0x66882222, 74, 50) { down -> touchA = if (down) 255 else 0 })
-        abxyBot.addView(makePadButton("B (DRV)", 0x66227733, 74, 50) { down -> touchB = if (down) 255 else 0 })
+        val abxyMid = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        abxyMid.addView(makePadButton("X", 0x66225599, 56, 48) { down -> touchX = if (down) 255 else 0 })
+        val spacer = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(1))
+        }
+        abxyMid.addView(spacer)
+        abxyMid.addView(makePadButton("B", 0x66992222, 56, 48) { down -> touchB = if (down) 255 else 0 })
 
-        val pedals = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        pedals.addView(makePadButton("BRAKE", 0x77992222, 82, 64) { down -> touchLt = if (down) 255 else 0 })
-        pedals.addView(makePadButton("GAS", 0x77228833, 92, 64) { down -> touchRt = if (down) 255 else 0 })
+        val abxyBot = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        abxyBot.addView(makePadButton("A", 0x66228833, 56, 48) { down -> touchA = if (down) 255 else 0 })
+
+        val pedals = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        pedals.addView(makePadButton("LT", 0x77883322, 78, 52) { down -> touchLt = if (down) 255 else 0 })
+        pedals.addView(makePadButton("RT", 0x77228844, 86, 52) { down -> touchRt = if (down) 255 else 0 })
 
         rightCluster.addView(abxyTop)
+        rightCluster.addView(abxyMid)
         rightCluster.addView(abxyBot)
         rightCluster.addView(pedals)
         layer.addView(

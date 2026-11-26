@@ -272,12 +272,9 @@ Mode Desktop() {
 Mode Output() { return Desktop(); }
 
 float RenderScale(uint32_t guest_height) {
-    const Mode m = Output();
     if (guest_height == 0) return 1.0f;
-    // Cap internal render scale cleanly on Mali-G57 non-BC (1.25x = 800x600) for crisp 60 FPS
-    const float raw = (static_cast<float>(m.height) * (static_cast<float>(g_settings.render_percent) / 100.0f)) /
-                      static_cast<float>(guest_height);
-    return std::clamp(raw, 1.0f, 1.25f);
+    // Native 1.0x (640x480) on Mali-G57 keeps GPU fillrate and thermal headroom maximally light
+    return 1.0f;
 }
 
 bool Widescreen() {

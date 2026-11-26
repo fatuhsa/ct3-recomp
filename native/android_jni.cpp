@@ -288,25 +288,26 @@ Java_com_ct2recomp_android_NativeBridge_nativeGetDiagStatus(JNIEnv* env, jclass)
         buf, sizeof(buf),
         "CT3 XBE Recomp: %s\n"
         "GPU: %s (%s 0x%04X) | VK %u.%u | %.1f FPS (GPU %.0f%%)\n"
-        "Quirks: dynRender=%s | timeline=%s | BC=%s\n"
-        "Swapchain: %s (%ux%u, %u imgs) | D3D8: %ux%u\n"
-        "Draws: %llu | Clears: %llu (0x%08X) | Copies: %llu | Swaps: %llu\n"
+        "Perf: ren=%.1fms wait=%.1fms | d/f=%u p/f=%u | up=%.1fMB st=%u tex=%.1fms pso=%u\n"
+        "Swapchain: %s (%ux%u, %u imgs) | D3D8: %ux%u | Draws: %llu | Swaps: %llu\n"
         "ROM: %s (%zu files) | Bat %.1fC",
         g_rt.boot_status.c_str(),
         gpu_name.empty() ? "Init..." : gpu_name.c_str(),
         vendor_tag, vendor_id, api_maj, api_min,
         static_cast<double>(m.fps.load()),
         static_cast<double>(m.gpu_load_pct.load()),
-        m.dynamic_rendering.load() ? "ON" : "CachedRP",
-        m.timeline_sem.load() ? "VK1.2" : "VkFence",
-        m.bc_supported.load() ? "HW" : "CPU-Cap384M",
+        static_cast<double>(m.render_ms.load()),
+        static_cast<double>(m.title_wait_ms.load()),
+        m.draws_per_frame.load(),
+        m.passes_per_frame.load(),
+        static_cast<double>(m.upload_mb_per_frame.load()),
+        m.stalls_total.load(),
+        static_cast<double>(m.tex_ms_per_sec.load()),
+        m.pipes_total.load(),
         m.vk_ready.load() ? "OK" : "WAIT",
         m.swap_width.load(), m.swap_height.load(), m.swap_images.load(),
         m.d3d_width.load(), m.d3d_height.load(),
         static_cast<unsigned long long>(m.draws.load()),
-        static_cast<unsigned long long>(m.clears.load()),
-        m.last_clear_argb.load(),
-        static_cast<unsigned long long>(m.copies.load()),
         static_cast<unsigned long long>(m.presents.load()),
         g_rt.rom.IsOpen() ? g_rt.rom.Info().display_name.c_str() : "Not loaded",
         g_rt.rom.Xiso().FileCount(),

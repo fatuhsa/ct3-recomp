@@ -26,6 +26,7 @@
 #include "gpu/backend.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
+#include "native/ct3_sdk_bridge.h"
 
 namespace gpu {
 
@@ -92,7 +93,7 @@ std::vector<Range> StateRanges() {
         {At(s, &s.simple[kMPsRgbOutputs >> 2]), SimpleBytes(kMPsRgbOutputs, kMPsInputTexture)},
         {At(s, &s.rs), At(s, &s.textures) - At(s, &s.rs)},
         {At(s, &s.index_buffer), At(s, &s.vs) - At(s, &s.index_buffer)},
-        {At(s, &s.vsc), At(s, &s.rt) - At(s, &s.vsc)},
+        {At(s, &s.psc), At(s, &s.rt) - At(s, &s.psc)},
         {At(s, &s.scissor_count), At(s, &s.transforms) - At(s, &s.scissor_count)},
         {At(s, &s.transforms[2]), 2 * sizeof(s.transforms[0])},
         {At(s, &s.transforms[16]), 4 * sizeof(s.transforms[0])},
@@ -381,6 +382,10 @@ private:
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
         for (const Range& r : ranges_) SendRange(now, r);
+        if ((s.vs_handle & 1) && s.vs && !s.vs->program.empty()) {
+            static const Range kVscRange = {At(s, &s.vsc), sizeof(s.vsc)};
+            SendRange(now, kVscRange);
+        }
         std::array<uint32_t, 4> textures;
         for (size_t i = 0; i < 4; i++) textures[i] = Header(s.textures[i]);
         Delta(&sent_.textures, &textures, sizeof(textures));
@@ -448,6 +453,7 @@ private:
             waiting_--;
         }
         uint64_t ns = Ns(t);
+        ct2::sdk_bridge::Metrics().title_wait_ns_accum.fetch_add(ns, std::memory_order_relaxed);
         g_perf_wait_ns += ns;
         g_perf_wait_kind_ns[size_t(kind)] += ns;
         if (why) {
@@ -469,9 +475,11 @@ private:
                 b = queue_.front();
                 queue_.pop_front();
             }
-            auto t = PerfNow();
+            auto t = Clock::now();
             for (const Cmd& c : b->cmds) Execute(*b, c);
-            if (diag::Perf()) g_perf.render_ns += Ns(t);
+            uint64_t rns = Ns(t);
+            ct2::sdk_bridge::Metrics().render_ns_accum.fetch_add(rns, std::memory_order_relaxed);
+            if (diag::Perf()) g_perf.render_ns += rns;
             uint64_t id = b->id;
             b->cmds.clear();
             b->bytes.clear();

@@ -35,6 +35,18 @@ struct LiveBootMetrics {
     std::atomic<uint32_t> swap_images{0};
     std::atomic<float> fps{0.0f};
     std::atomic<float> gpu_load_pct{0.0f};
+
+    // Live 0.5s-windowed profiler metrics (zero-lock atomics for HUD diagnosis)
+    std::atomic<uint64_t> render_ns_accum{0};
+    std::atomic<uint64_t> title_wait_ns_accum{0};
+    std::atomic<float> render_ms{0.0f};
+    std::atomic<float> title_wait_ms{0.0f};
+    std::atomic<float> upload_mb_per_frame{0.0f};
+    std::atomic<float> tex_ms_per_sec{0.0f};
+    std::atomic<uint32_t> draws_per_frame{0};
+    std::atomic<uint32_t> passes_per_frame{0};
+    std::atomic<uint32_t> stalls_total{0};
+    std::atomic<uint32_t> pipes_total{0};
 };
 
 struct GamepadState {

@@ -59,7 +59,7 @@ namespace gpu {
 namespace {
 
 constexpr int kFrames = 3;
-constexpr VkDeviceSize kUploadSize = 32ull << 20;  // per frame: vertices, indices, constants, texture staging
+constexpr VkDeviceSize kUploadSize = 48ull << 20;  // per frame: vertices, indices, constants, texture staging
 constexpr VkDeviceSize kUboRange = 3072;           // b0 and b1: 192 vertex constants, DrawConstants under it
 constexpr VkDeviceSize kUboAlign = 256;
 constexpr VkFormat kBgra = VK_FORMAT_B8G8R8A8_UNORM;
@@ -1281,6 +1281,15 @@ private:
         // tenth of the render thread. A view destroyed may have its handle reused, so a set made before is let go
         // (set_gen against view_gen_) and the pools are reset once the GPU is past them (pools_dirty)
         std::unordered_map<uint64_t, VkDescriptorSet> sets;
+        // Zero-malloc fixed open-addressed per-frame static VB upload dedup table (O(1) clear via vb_gen++)
+        struct VbSlot {
+            uint64_t key = 0;
+            VkDeviceSize off = 0;
+            uint32_t gen = 0;
+        };
+        static constexpr size_t kVbSlots = 2048;
+        std::array<VbSlot, kVbSlots> vb_cache{};
+        uint32_t vb_gen = 1;
         uint64_t set_gen = 0;
         bool pools_dirty = false;
         VkSemaphore acquire = VK_NULL_HANDLE;
@@ -2394,6 +2403,10 @@ bool VulkanBackend::ResetFrame(Frame& f) {
         f.pools_dirty = false;
     }
     f.used = 0;
+    if (++f.vb_gen == 0) {
+        f.vb_cache.fill({});
+        f.vb_gen = 1;
+    }
     upload_epoch_++;
     return true;
 }
@@ -4019,13 +4032,41 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (!dc.cpu) return;
     VkBuffer vbufs[16];
     VkDeviceSize voffs[16];
+    Frame& cur_f = CurrentFrame();
+    const uint8_t* asm_vbase = a.vertices.empty() ? nullptr : reinterpret_cast<const uint8_t*>(a.vertices.data());
+    const uint8_t* asm_vend = asm_vbase ? asm_vbase + a.vertices.size() * sizeof(float) : nullptr;
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
+        bool cacheable = b.src && b.bytes >= 256 && b.bytes <= kUploadSize / 4 &&
+                         !(asm_vbase && b.src >= asm_vbase && b.src < asm_vend) &&
+                         (a.gathered[i].empty() || b.src != a.gathered[i].data());
+        uint64_t vb_key = 0;
+        size_t slot_idx = 0;
+        if (cacheable) {
+            uint64_t head = 0, tail = 0;
+            std::memcpy(&head, b.src, 8);
+            std::memcpy(&tail, b.src + b.bytes - 8, 8);
+            uint64_t kdata[4] = {uint64_t(reinterpret_cast<uintptr_t>(b.src)), uint64_t(b.bytes), head, tail};
+            vb_key = Hash(kdata, sizeof(kdata));
+            slot_idx = size_t(vb_key) & (Frame::kVbSlots - 1);
+            const auto& slot = cur_f.vb_cache[slot_idx];
+            if (slot.gen == cur_f.vb_gen && slot.key == vb_key) {
+                vbufs[i] = cur_f.upload.buf;
+                voffs[i] = slot.off;
+                continue;
+            }
+        }
         Alloc v = Upload(std::max<uint32_t>(b.bytes, 4), 16);
         if (!v.cpu) return;
         if (b.src && b.bytes) std::memcpy(v.cpu, b.src, b.bytes);
         vbufs[i] = v.buf;
         voffs[i] = v.off;
+        if (cacheable && v.buf == CurrentFrame().upload.buf) {
+            auto& slot = CurrentFrame().vb_cache[slot_idx];
+            slot.key = vb_key;
+            slot.off = v.off;
+            slot.gen = CurrentFrame().vb_gen;
+        }
     }
     Alloc ib{};
     if (a.index_count) {
@@ -4670,6 +4711,7 @@ void VulkanBackend::Present(const Surface& front) {
     if (gpu_failed_) return;
     bool timed = pass_log_ && pass_times_ && pass_stamps_;
     if (timed) vkCmdWriteTimestamp(Cb(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pass_times_, pass_stamps_++);
+    const VkDeviceSize frame_used = CurrentFrame().used;
     if (!Submit(false, shown)) return;
     if (timeline_ok_) QueuePoolReset(CurrentFrame());
     present_value_[presents_ % (kFrames + 1)].store(value_);
@@ -4733,16 +4775,36 @@ void VulkanBackend::Present(const Surface& front) {
     }
     ReleaseOldTextures();
     fps_n_++;
+    static uint64_t perf_upload_bytes = 0, perf_last_draws = 0, perf_last_passes = 0, perf_last_tex_ns = 0;
+    perf_upload_bytes += frame_used;
     auto now = std::chrono::steady_clock::now();
     double el = std::chrono::duration<double>(now - fps_t_).count();
+    auto& metrics = ct2::sdk_bridge::Metrics();
     if (el >= 0.5) {
+        const double nf = double(std::max<uint32_t>(fps_n_, 1u));
         fps_ = fps_n_ / el;
+        const uint64_t rns = metrics.render_ns_accum.exchange(0, std::memory_order_relaxed);
+        const uint64_t wns = metrics.title_wait_ns_accum.exchange(0, std::memory_order_relaxed);
+        const uint64_t ddraws = g_perf.draws - perf_last_draws;
+        const uint64_t dpasses = g_perf.passes - perf_last_passes;
+        const uint64_t dtex = g_perf.tex_ns - perf_last_tex_ns;
+        perf_last_draws = g_perf.draws;
+        perf_last_passes = g_perf.passes;
+        perf_last_tex_ns = g_perf.tex_ns;
+        metrics.render_ms.store(float(double(rns) / (nf * 1e6)), std::memory_order_relaxed);
+        metrics.title_wait_ms.store(float(double(wns) / (nf * 1e6)), std::memory_order_relaxed);
+        metrics.draws_per_frame.store(uint32_t(ddraws / std::max<uint32_t>(fps_n_, 1u)), std::memory_order_relaxed);
+        metrics.passes_per_frame.store(uint32_t(dpasses / std::max<uint32_t>(fps_n_, 1u)), std::memory_order_relaxed);
+        metrics.upload_mb_per_frame.store(float(double(perf_upload_bytes) / (nf * 1048576.0)), std::memory_order_relaxed);
+        metrics.tex_ms_per_sec.store(float(double(dtex) / (el * 1e6)), std::memory_order_relaxed);
+        metrics.stalls_total.store(uint32_t(g_perf.stalls), std::memory_order_relaxed);
+        metrics.pipes_total.store(uint32_t(g_perf.pipes), std::memory_order_relaxed);
+        perf_upload_bytes = 0;
         fps_n_ = 0;
         fps_t_ = now;
         if (time_bits_) g_gpu_load = float(std::min(100.0, gpu_ns_ / (el * 1e7)));
         gpu_ns_ = 0;
     }
-    auto& metrics = ct2::sdk_bridge::Metrics();
     metrics.presents.fetch_add(1, std::memory_order_relaxed);
     metrics.fps.store(fps_, std::memory_order_release);
     metrics.gpu_load_pct.store(std::max(0.0f, g_gpu_load.load(std::memory_order_relaxed)),
