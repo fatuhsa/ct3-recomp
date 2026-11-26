@@ -40,12 +40,19 @@ jobs:
         shell: bash
         env:
           XBE_KEY: ${{ secrets.XBE_KEY }}
+          XBE_ENC_URL: ${{ secrets.XBE_ENC_URL }}
         run: |
           set -euo pipefail
+          if [[ ! -f ci/default.xbe.enc && -n "${XBE_ENC_URL}" ]]; then
+            mkdir -p ci
+            curl -fsSL "$XBE_ENC_URL" -o ci/default.xbe.enc
+          fi
           if [[ ! -f ci/default.xbe.enc || -z "${XBE_KEY}" ]]; then
-            echo "Skipping XBE lifting (ci/default.xbe.enc or XBE_KEY not set); building diagnostic APK."
+            echo "XBE_LIFTED=false" >> "$GITHUB_ENV"
+            echo "Skipping XBE lifting (no user-supplied encrypted XBE); building open-source host shell APK."
             exit 0
           fi
+          echo "XBE_LIFTED=true" >> "$GITHUB_ENV"
 
           mkdir -p assets generated/game
           KEY_FILE="${RUNNER_TEMP}/xbe.key"
@@ -549,6 +556,7 @@ jobs:
           echo "OK: All LOAD segments in libmain.so are 16 KB aligned."
 
       - name: Upload APK
+        if: ${{ github.event.repository.private == true || env.XBE_LIFTED != 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: ct3-recomp-arm64-apk
@@ -557,6 +565,7 @@ jobs:
           retention-days: 14
 
       - name: Upload unstripped libmain.so (for simpleperf & hang symbolization)
+        if: ${{ github.event.repository.private == true || env.XBE_LIFTED != 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: ct3-recomp-arm64-symbols

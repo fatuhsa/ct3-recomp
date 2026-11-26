@@ -10,6 +10,7 @@ android/local.properties
 sdk/
 assets/
 generated/
+ci/*.enc
 
 # IDE & OS
 .idea/
