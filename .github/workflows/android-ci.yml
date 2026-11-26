@@ -304,6 +304,7 @@ jobs:
                           prim = v;
                           vertices.clear();
                           indices.clear();
+                          if (indices.capacity() < 4096) indices.reserve(4096);
                       } else if (prim) {
                           if (!indices.empty()) {
                               SyncDeferred();
@@ -326,6 +327,33 @@ jobs:
           }"""
           assert old_endpush in s, "EndPush block not found"
           s = s.replace(old_endpush, new_endpush, 1)
+
+          old_vblank = """HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(16));
+              return 0;
+          }"""
+          new_vblank = """bool g_swapped_since_vblank = false;
+          HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
+              bool skip = false;
+              {
+                  std::lock_guard<std::recursive_mutex> lock(g_lock);
+                  skip = g_swapped_since_vblank;
+                  g_swapped_since_vblank = false;
+              }
+              if (skip) return 0;
+              app::Pace();
+              return 0;
+          }"""
+          assert old_vblank in s, "BlockUntilVerticalBlank block not found"
+          s = s.replace(old_vblank, new_vblank, 1)
+
+          old_swap_pace = """    if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
+              app::Pace();"""
+          new_swap_pace = """    if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
+              g_swapped_since_vblank = true;
+              app::Pace();"""
+          assert old_swap_pace in s, "Swap Pace line not found"
+          s = s.replace(old_swap_pace, new_swap_pace, 1)
 
           extra_hooks = """
           #ifdef SYM_D3DDevice_GetProjectionViewportMatrix

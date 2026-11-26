@@ -43,10 +43,10 @@ android {
             externalNativeBuild {
                 cmake {
                     // Always keep -O2 Release optimization on native/recomp code even in debug APKs;
-                    // gate debug verbosity via a dedicated flag instead.
+                    // keep verbose disk logging off so hot loops stay stutter-free.
                     arguments += listOf(
                         "-DCMAKE_BUILD_TYPE=Release",
-                        "-DCT2_VERBOSE_LOG=ON"
+                        "-DCT2_VERBOSE_LOG=OFF"
                     )
                 }
             }

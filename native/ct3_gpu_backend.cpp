@@ -797,7 +797,7 @@ std::string PointsHlsl(const std::string& src) {
 bool UnitTexcoords(const Assembled& a) {
     constexpr float kLo = -1e-4f, kHi = 1.0001f;
     constexpr uint32_t kSmallDrawVertices = 4096;
-    if (!a.vertices.empty() || !a.vertex_count || a.vertex_count > kSmallDrawVertices) return false;
+    if (!a.pretransformed || !a.vertices.empty() || !a.vertex_count || a.vertex_count > kSmallDrawVertices) return false;
     bool any = false;
     for (int r = 0; r < 16; r++) {
         const VertexElement& e = a.elements[size_t(r)];
@@ -1226,6 +1226,7 @@ private:
         // tenth of the render thread. A view destroyed may have its handle reused, so a set made before is let go
         // (set_gen against view_gen_) and the pools are reset once the GPU is past them (pools_dirty)
         std::unordered_map<uint64_t, VkDescriptorSet> sets;
+        std::unordered_map<uint64_t, VkDeviceSize> vb_cache;  // per-frame static VB slice dedup
         uint64_t set_gen = 0;
         bool pools_dirty = false;
         VkSemaphore acquire = VK_NULL_HANDLE;
@@ -1394,8 +1395,34 @@ private:
     PFN_vkCmdEndRenderingKHR end_rendering_ = nullptr;
     PFN_vkWaitSemaphoresKHR wait_semaphores_ = nullptr;
     PFN_vkGetSemaphoreCounterValueKHR counter_value_ = nullptr;
+    PFN_vkCmdSetCullMode cmd_set_cull_mode_ = nullptr;
+    PFN_vkCmdSetFrontFace cmd_set_front_face_ = nullptr;
+    PFN_vkCmdSetDepthTestEnable cmd_set_depth_test_ = nullptr;
+    PFN_vkCmdSetDepthWriteEnable cmd_set_depth_write_ = nullptr;
+    PFN_vkCmdSetDepthCompareOp cmd_set_depth_cmp_ = nullptr;
+    PFN_vkCmdSetStencilTestEnable cmd_set_stencil_test_ = nullptr;
+    PFN_vkCmdSetStencilOp cmd_set_stencil_op_ = nullptr;
+    bool ext_dyn_state_ = false;  // Vulkan 1.3 core dynamic cull/depth/stencil to cut PSO compilations
     bool dynamic_ = true;  // dynamic rendering; Vulkan 1.1 drivers (older Adrenos) only have render passes
     bool timeline_ok_ = true;  // without it a fence per submit stands in for the timeline's values
+    uint32_t pipes_since_save_ = 0;
+    // Per-command-buffer dynamic state cache to skip redundant vkCmd* calls across 1000+ draws/frame
+    VkPipeline cb_pipe_ = VK_NULL_HANDLE;
+    bool cb_vp_valid_ = false, cb_sc_valid_ = false, cb_blend_valid_ = false, cb_sref_valid_ = false;
+    bool cb_ext_valid_ = false;
+    float cb_vp_[4] = {};
+    int32_t cb_sc_[4] = {};
+    uint32_t cb_blend_color_ = 0;
+    uint32_t cb_sref_ = 0;
+    VkCullModeFlags cb_cull_ = VK_CULL_MODE_NONE;
+    VkFrontFace cb_ff_ = VK_FRONT_FACE_CLOCKWISE;
+    VkBool32 cb_zen_ = VK_FALSE, cb_zw_ = VK_FALSE, cb_sten_ = VK_FALSE;
+    VkCompareOp cb_zop_ = VK_COMPARE_OP_ALWAYS, cb_sfunc_ = VK_COMPARE_OP_ALWAYS;
+    VkStencilOp cb_sfail_ = VK_STENCIL_OP_KEEP, cb_spass_ = VK_STENCIL_OP_KEEP, cb_szfail_ = VK_STENCIL_OP_KEEP;
+    void ResetCbState() {
+        cb_pipe_ = VK_NULL_HANDLE;
+        cb_vp_valid_ = cb_sc_valid_ = cb_blend_valid_ = cb_sref_valid_ = cb_ext_valid_ = false;
+    }
     std::atomic<bool> gpu_failed_{false};
     struct Pending {
         uint64_t value;
@@ -1748,6 +1775,18 @@ bool VulkanBackend::CreateDevice() {
     if ((dynamic_ && (!begin_rendering_ || !end_rendering_)) || (timeline_ok_ && (!wait_semaphores_ || !counter_value_))) {
         LOGE("vulkan: device functions missing");
         return false;
+    }
+    if (core13) {
+        cmd_set_cull_mode_ = reinterpret_cast<PFN_vkCmdSetCullMode>(vkGetDeviceProcAddr(dev_, "vkCmdSetCullMode"));
+        cmd_set_front_face_ = reinterpret_cast<PFN_vkCmdSetFrontFace>(vkGetDeviceProcAddr(dev_, "vkCmdSetFrontFace"));
+        cmd_set_depth_test_ = reinterpret_cast<PFN_vkCmdSetDepthTestEnable>(vkGetDeviceProcAddr(dev_, "vkCmdSetDepthTestEnable"));
+        cmd_set_depth_write_ = reinterpret_cast<PFN_vkCmdSetDepthWriteEnable>(vkGetDeviceProcAddr(dev_, "vkCmdSetDepthWriteEnable"));
+        cmd_set_depth_cmp_ = reinterpret_cast<PFN_vkCmdSetDepthCompareOp>(vkGetDeviceProcAddr(dev_, "vkCmdSetDepthCompareOp"));
+        cmd_set_stencil_test_ = reinterpret_cast<PFN_vkCmdSetStencilTestEnable>(vkGetDeviceProcAddr(dev_, "vkCmdSetStencilTestEnable"));
+        cmd_set_stencil_op_ = reinterpret_cast<PFN_vkCmdSetStencilOp>(vkGetDeviceProcAddr(dev_, "vkCmdSetStencilOp"));
+        ext_dyn_state_ = cmd_set_cull_mode_ && cmd_set_front_face_ && cmd_set_depth_test_ &&
+                         cmd_set_depth_write_ && cmd_set_depth_cmp_ && cmd_set_stencil_test_ && cmd_set_stencil_op_;
+        if (ext_dyn_state_) LOGR("vulkan: Vulkan 1.3 extended dynamic state enabled (reduced PSO stutter)");
     }
     // the depth buffer: 24 bit with stencil as on the console where the GPU has it
     auto usable = [&](VkFormat f) {
@@ -2207,6 +2246,7 @@ void VulkanBackend::Begin() {
     }
     rendering_ = false;
     rend_color_ = rend_depth_ = nullptr;
+    ResetCbState();
 }
 
 void VulkanBackend::FailGpu(const char* operation, VkResult result, uint64_t value) {
@@ -2326,6 +2366,7 @@ bool VulkanBackend::ResetFrame(Frame& f) {
         f.set_gen = view_gen_;
         f.pools_dirty = false;
     }
+    f.vb_cache.clear();
     f.used = 0;
     upload_epoch_++;
     return true;
@@ -2537,6 +2578,7 @@ void VulkanBackend::EndRender() {
         vkCmdEndRenderPass(Cb());
     rendering_ = false;
     rend_color_ = rend_depth_ = nullptr;
+    ResetCbState();
 }
 
 // the layouts stay the attachment ones throughout, as with dynamic rendering: barriers outside do the transitions.
@@ -2616,11 +2658,17 @@ void VulkanBackend::DropFramebuffers(VkImageView v) {
 
 // in the D3D convention, y down from the top: a negative height turns Vulkan's clip space the same way up
 void VulkanBackend::SetViewport(float x, float y, float w, float h) {
+    if (cb_vp_valid_ && cb_vp_[0] == x && cb_vp_[1] == y && cb_vp_[2] == w && cb_vp_[3] == h) return;
+    cb_vp_valid_ = true;
+    cb_vp_[0] = x; cb_vp_[1] = y; cb_vp_[2] = w; cb_vp_[3] = h;
     VkViewport vp{x, y + h, w, -h, 0, 1};
     vkCmdSetViewport(Cb(), 0, 1, &vp);
 }
 
 void VulkanBackend::SetScissor(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
+    if (cb_sc_valid_ && cb_sc_[0] == x0 && cb_sc_[1] == y0 && cb_sc_[2] == x1 && cb_sc_[3] == y1) return;
+    cb_sc_valid_ = true;
+    cb_sc_[0] = x0; cb_sc_[1] = y0; cb_sc_[2] = x1; cb_sc_[3] = y1;
     VkRect2D r{{std::max(x0, 0), std::max(y0, 0)}, {uint32_t(std::max(x1 - std::max(x0, 0), 0)), uint32_t(std::max(y1 - std::max(y0, 0), 0))}};
     vkCmdSetScissor(Cb(), 0, 1, &r);
 }
@@ -2787,7 +2835,7 @@ VkPipeline VulkanBackend::FullScreenPipeline(const char* hlsl, const char* ps_en
 
 // shadercache/preload.bin: its header, then records, each a tag and what it lists
 constexpr uint32_t kListMagic = 0x4C50574D;  // "MWPL"
-constexpr uint32_t kListVersion = 1;
+constexpr uint32_t kListVersion = 2;
 constexpr uint32_t kListShader = 1, kListPipeline = 2;  // a record's tag: a shader's key and hash, a PsoKey
 
 VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps) {
@@ -2804,6 +2852,7 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k, VkShaderModule vs, VkS
     g_perf.pipe_ns += SinceNs(t);
     g_perf.pipes++;
     pipelines_[h] = pipe;
+    if (pipe) pipes_since_save_++;
     if (pipe && listed_.insert(h).second) Record(kListPipeline, &k, sizeof(k));
     return pipe;
 }
@@ -2877,10 +2926,21 @@ VkPipeline VulkanBackend::BuildPipeline(const PsoKey& k, VkShaderModule vs, VkSh
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = k.has_rt ? 1 : 0;
     cb.pAttachments = &ba;
-    VkDynamicState dyn[4] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-                             VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+    VkDynamicState dyn[11] = {
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE,
+        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+        VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+        VK_DYNAMIC_STATE_STENCIL_OP,
+    };
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dy.dynamicStateCount = 4;
+    dy.dynamicStateCount = ext_dyn_state_ ? 11u : 4u;
     dy.pDynamicStates = dyn;
     VkFormat color = VkFormat(k.rtfmt);
     VkPipelineRenderingCreateInfoKHR rinfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
@@ -3261,11 +3321,13 @@ void VulkanBackend::Blit(Image& dst, const VkRect2D& to, Image& src, const float
     const VkSampler samplers[4] = {linear_, point_, point_, point_};
     VkDescriptorSet set = Set(views, samplers);
     BeginRender(&dst, nullptr);
+    ResetCbState();
     vkCmdBindPipeline(Cb(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     BindSet(set, cb.off, cb.off);
     SetViewport(float(to.offset.x), float(to.offset.y), float(to.extent.width), float(to.extent.height));
     SetScissor(0, 0, int32_t(dst.w), int32_t(dst.h));
     vkCmdDraw(Cb(), 3, 1, 0, 0);
+    ResetCbState();
 }
 
 // a copy of the target to read while drawing to it
@@ -3303,11 +3365,13 @@ bool VulkanBackend::DepthCopy(const State& s) {
     const VkSampler samplers[4] = {linear_, point_, point_, point_};
     VkDescriptorSet set = Set(views, samplers);
     BeginRender(nullptr, &dst.img);
+    ResetCbState();
     vkCmdBindPipeline(Cb(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     BindSet(set, cb.off, cb.off);
     SetViewport(0, 0, float(dst.w), float(dst.h));
     SetScissor(0, 0, int32_t(dst.w), int32_t(dst.h));
     vkCmdDraw(Cb(), 3, 1, 0, 0);
+    ResetCbState();
     dst.drawn = true;
     return true;
 }
@@ -3789,16 +3853,30 @@ void VulkanBackend::BuildPipelineKey(const State& s, const Assembled& a, const D
     KeyBlend(s, k);
     if (k.has_ds) KeyDepthStencil(s, a, k);
     KeyRasterizer(s, a, k);
+    if (ext_dyn_state_) {
+        k.cull = 0;
+        k.ccw = 0;
+        k.zen = 0;
+        k.zwrite = 0;
+        k.zfunc = 0;
+        k.sten = 0;
+        k.sfunc = 0;
+        k.sfail = 0;
+        k.szfail = 0;
+        k.spass = 0;
+    }
 }
 
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     if (gpu_failed_) return;
     ct2::sdk_bridge::Metrics().draws.fetch_add(1, std::memory_order_relaxed);
     ct2::sdk_bridge::Metrics().last_draw_verts.store(count, std::memory_order_relaxed);
-    ct2::diag::FrameCounters fc{};
-    fc.draws = 1;
-    fc.verts = count;
-    ct2::diag::AddCounters(fc);
+    if (ct2::diag::Perf()) {
+        ct2::diag::FrameCounters fc{};
+        fc.draws = 1;
+        fc.verts = count;
+        ct2::diag::AddCounters(fc);
+    }
     if (DepthCopy(s)) return;
     Assembled& a = asm_;
     if (!Assemble(s, prim, start, count, indices, a)) return;
@@ -3915,13 +3993,35 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (!dc.cpu) return;
     VkBuffer vbufs[16];
     VkDeviceSize voffs[16];
+    Frame& cur_f = CurrentFrame();
+    const uint8_t* asm_vbase = a.vertices.empty() ? nullptr : reinterpret_cast<const uint8_t*>(a.vertices.data());
+    const uint8_t* asm_vend = asm_vbase ? asm_vbase + a.vertices.size() * sizeof(float) : nullptr;
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
+        bool cacheable = b.src && b.bytes >= 128 && b.bytes <= kUploadSize / 4 &&
+                         !(asm_vbase && b.src >= asm_vbase && b.src < asm_vend) &&
+                         (a.gathered[i].empty() || b.src != a.gathered[i].data());
+        uint64_t vb_key = 0;
+        if (cacheable) {
+            uint64_t head = 0, tail = 0;
+            std::memcpy(&head, b.src, 8);
+            std::memcpy(&tail, b.src + b.bytes - 8, 8);
+            uint64_t kdata[4] = {uint64_t(reinterpret_cast<uintptr_t>(b.src)), uint64_t(b.bytes), head, tail};
+            vb_key = Hash(kdata, sizeof(kdata));
+            if (auto it = cur_f.vb_cache.find(vb_key); it != cur_f.vb_cache.end()) {
+                vbufs[i] = cur_f.upload.buf;
+                voffs[i] = it->second;
+                continue;
+            }
+        }
         Alloc v = Upload(std::max<uint32_t>(b.bytes, 4), 16);
         if (!v.cpu) return;
         if (b.src && b.bytes) std::memcpy(v.cpu, b.src, b.bytes);
         vbufs[i] = v.buf;
         voffs[i] = v.off;
+        if (cacheable && v.buf == CurrentFrame().upload.buf) {
+            CurrentFrame().vb_cache[vb_key] = v.off;
+        }
     }
     Alloc ib{};
     if (a.index_count) {
@@ -3939,7 +4039,11 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     BeginRender(draw_rt_ ? &draw_rt_->img : nullptr, draw_ds_ ? &draw_ds_->img : nullptr);
     if (draw_rt_) draw_rt_->drawn = true, draw_rt_->writes++;
     if (draw_ds_) draw_ds_->drawn = true;
-    vkCmdBindPipeline(Cb(), VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    VkCommandBuffer cb = Cb();
+    if (pipe != cb_pipe_) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        cb_pipe_ = pipe;
+    }
     BindSet(set, vc.off, dc.off);
     Target& bt = draw_rt_ ? *draw_rt_ : *draw_ds_;
     float W = float(bt.w), H = float(bt.h);
@@ -3962,16 +4066,51 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     SetScissor(std::clamp(x0, 0, int32_t(W)), std::clamp(y0, 0, int32_t(H)), std::clamp(x1, 0, int32_t(W)),
                std::clamp(y1, 0, int32_t(H)));
-    float bf[4];
-    Color(SimpleState(s, kMBlendColor), bf);
-    vkCmdSetBlendConstants(Cb(), bf);
-    vkCmdSetStencilReference(Cb(), VK_STENCIL_FACE_FRONT_AND_BACK, SimpleState(s, kMStencilRef) & 0xFF);
-    if (a.buffer_count) vkCmdBindVertexBuffers(Cb(), 0, a.buffer_count, vbufs, voffs);
+    uint32_t bcol = SimpleState(s, kMBlendColor);
+    if (!cb_blend_valid_ || bcol != cb_blend_color_) {
+        float bf[4];
+        Color(bcol, bf);
+        vkCmdSetBlendConstants(cb, bf);
+        cb_blend_valid_ = true;
+        cb_blend_color_ = bcol;
+    }
+    uint32_t sref = SimpleState(s, kMStencilRef) & 0xFF;
+    if (!cb_sref_valid_ || sref != cb_sref_) {
+        vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, sref);
+        cb_sref_valid_ = true;
+        cb_sref_ = sref;
+    }
+    if (ext_dyn_state_) {
+        constexpr uint32_t kCullCw = 0x900;
+        uint32_t cull_rs = s.rs[kRsCullMode];
+        VkCullModeFlags cull_m = (cull_rs != 0 && a.topology == Topology::Triangles) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+        VkFrontFace ff = (cull_rs == kCullCw) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+        VkBool32 zen = (draw_ds_ && s.rs[kRsZEnable] != 0) ? VK_TRUE : VK_FALSE;
+        VkBool32 zw = (zen && SimpleState(s, kMZWriteEnable) != 0) ? VK_TRUE : VK_FALSE;
+        VkCompareOp zop = zen ? Cmp(SimpleState(s, kMZFunc)) : VK_COMPARE_OP_ALWAYS;
+        VkBool32 sten = (draw_ds_ && s.rs[kRsStencilEnable] != 0) ? VK_TRUE : VK_FALSE;
+        VkStencilOp sfail = sten ? StencilOp(s.rs[kRsStencilFail]) : VK_STENCIL_OP_KEEP;
+        VkStencilOp spass = sten ? StencilOp(SimpleState(s, kMStencilPass)) : VK_STENCIL_OP_KEEP;
+        VkStencilOp szfail = sten ? StencilOp(SimpleState(s, kMStencilZFail)) : VK_STENCIL_OP_KEEP;
+        VkCompareOp sfunc = sten ? Cmp(SimpleState(s, kMStencilFunc)) : VK_COMPARE_OP_ALWAYS;
+        if (!cb_ext_valid_ || cull_m != cb_cull_) { cmd_set_cull_mode_(cb, cull_m); cb_cull_ = cull_m; }
+        if (!cb_ext_valid_ || ff != cb_ff_) { cmd_set_front_face_(cb, ff); cb_ff_ = ff; }
+        if (!cb_ext_valid_ || zen != cb_zen_) { cmd_set_depth_test_(cb, zen); cb_zen_ = zen; }
+        if (!cb_ext_valid_ || zw != cb_zw_) { cmd_set_depth_write_(cb, zw); cb_zw_ = zw; }
+        if (!cb_ext_valid_ || zop != cb_zop_) { cmd_set_depth_cmp_(cb, zop); cb_zop_ = zop; }
+        if (!cb_ext_valid_ || sten != cb_sten_) { cmd_set_stencil_test_(cb, sten); cb_sten_ = sten; }
+        if (!cb_ext_valid_ || sfail != cb_sfail_ || spass != cb_spass_ || szfail != cb_szfail_ || sfunc != cb_sfunc_) {
+            cmd_set_stencil_op_(cb, VK_STENCIL_FACE_FRONT_AND_BACK, sfail, spass, szfail, sfunc);
+            cb_sfail_ = sfail; cb_spass_ = spass; cb_szfail_ = szfail; cb_sfunc_ = sfunc;
+        }
+        cb_ext_valid_ = true;
+    }
+    if (a.buffer_count) vkCmdBindVertexBuffers(cb, 0, a.buffer_count, vbufs, voffs);
     if (a.index_count) {
-        vkCmdBindIndexBuffer(Cb(), ib.buf, ib.off, a.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(Cb(), a.index_count, 1, 0, a.base_vertex, 0);
+        vkCmdBindIndexBuffer(cb, ib.buf, ib.off, a.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cb, a.index_count, 1, 0, a.base_vertex, 0);
     } else {
-        vkCmdDraw(Cb(), a.draw_count, 1, 0, 0);
+        vkCmdDraw(cb, a.draw_count, 1, 0, 0);
     }
 }
 
@@ -4314,11 +4453,13 @@ void VulkanBackend::DrawFrame(Target* t, uint32_t index) {
         vkCmdBeginRenderPass(cb, &bi, VK_SUBPASS_CONTENTS_INLINE);
     }
     if (pipe) {
+        ResetCbState();
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         BindSet(set, cbuf.off, cbuf.off);
         SetViewport((w - vw) / 2, (h - vh) / 2, vw, vh);
         SetScissor(0, 0, int32_t(w), int32_t(h));
         vkCmdDraw(cb, 3, 1, 0, 0);
+        ResetCbState();
     }
     RenderUi();
     if (dynamic_)
@@ -4627,7 +4768,10 @@ void VulkanBackend::Present(const Surface& front) {
     metrics.fps.store(fps_, std::memory_order_release);
     metrics.gpu_load_pct.store(std::max(0.0f, g_gpu_load.load(std::memory_order_relaxed)),
                                std::memory_order_release);
-    if (presents_ % 600 == 0) SavePipelineCache();
+    if (pipes_since_save_ >= 32 || (presents_ % 600 == 0 && pipes_since_save_ > 0)) {
+        SavePipelineCache();
+        pipes_since_save_ = 0;
+    }
     if (!preload_started_ && game::Opt().shader_preload) StartPreload();
     ApplySettings();
 }
