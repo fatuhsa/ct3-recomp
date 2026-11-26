@@ -25,6 +25,10 @@ saves/
 *.iso
 *.xiso
 *.xbe
+*.apk
+*.aab
+*.keystore
+*.jks
 *.chd
 *.gdi
 *.cdi

@@ -4,7 +4,7 @@ set -euo pipefail
 # Extracts default.xbe from a Crazy Taxi 3: High Roller (USA) Original Xbox XISO
 # and optionally encrypts it to ci/default.xbe.enc for GitHub Actions lifting (XBE_KEY secret).
 # Usage:
-#   ./tools/extract_and_encrypt_xbe.sh "/root/Crazy Taxi 3 - High Roller (USA).iso" [passphrase]
+#   ./tools/extract_and_encrypt_xbe.sh "/path/to/Crazy Taxi 3 - High Roller (USA).iso" [passphrase]
 
 ISO_PATH="${1:-}"
 PASSPHRASE="${2:-}"
