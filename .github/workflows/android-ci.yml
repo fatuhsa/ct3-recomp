@@ -237,6 +237,96 @@ jobs:
           assert old_xform in s, "SetTransform block not found"
           s = s.replace(old_xform, new_xform, 1)
 
+          old_endpush = """HLE_STDCALL(D3DDevice_EndPush, 1) {
+              std::lock_guard<std::recursive_mutex> lock(g_lock);
+              constexpr uint32_t kBeginEnd = 0x17FC, kInlineArray = 0x1818;
+              static std::vector<uint32_t> vertices;
+              uint32_t prim = 0;
+              for (uint32_t p = g_push_begin, end = a[0]; g_push_begin && p + 4 <= end;) {
+                  // count in bits 18 to 28, bit 30 keeps the method for every value
+                  uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
+                  p += 4;
+                  if ((head & 0xA0030003) || n * 4 > end - p) {  // anything but a method header
+                      LOG_FIRST(8, "d3d: EndPush stops at command %08X, %u bytes before the end", head, end - p);
+                      break;
+                  }
+                  for (uint32_t i = 0; i < n; i++, p += 4) {
+                      uint32_t m = head & 0x40000000 ? method : method + i * 4, v = R32(p);
+                      ApplyVisibilityMethod(m, v);
+                      if (m == kInlineArray) {
+                          if (prim) vertices.push_back(v);
+                      } else if (m != kBeginEnd) {
+                          if (m >> 2 < g_state.simple.size()) g_state.simple[m >> 2] = v;
+                      } else if (v) {
+                          prim = v;
+                          vertices.clear();
+                      } else if (prim) {
+                          uint32_t stride = VertexBytes(), bytes = uint32_t(vertices.size()) * 4;
+                          if (stride && bytes % stride == 0) DrawUp(prim, bytes / stride, vertices.data(), stride);
+                          else LOG_FIRST(8, "d3d: EndPush primitive %u dropped, %u bytes of vertices of %u", prim, bytes, stride);
+                          prim = 0;
+                      }
+                  }
+              }
+              g_push_begin = 0;
+              ScratchPush();
+              return a[0];
+          }"""
+          new_endpush = """HLE_STDCALL(D3DDevice_EndPush, 1) {
+              std::lock_guard<std::recursive_mutex> lock(g_lock);
+              constexpr uint32_t kBeginEnd = 0x17FC, kArrayElem16 = 0x1800, kArrayElem32 = 0x1808, kInlineArray = 0x1818;
+              static std::vector<uint32_t> vertices;
+              static std::vector<uint16_t> indices;
+              uint32_t prim = 0;
+              for (uint32_t p = g_push_begin, end = a[0]; g_push_begin && p + 4 <= end;) {
+                  // count in bits 18 to 28, bit 30 keeps the method for every value
+                  uint32_t head = R32(p), method = head & 0x1FFC, n = (head >> 18) & 0x7FF;
+                  p += 4;
+                  if ((head & 0xA0030003) || n * 4 > end - p) {  // anything but a method header
+                      LOG_FIRST(8, "d3d: EndPush stops at command %08X, %u bytes before the end", head, end - p);
+                      break;
+                  }
+                  for (uint32_t i = 0; i < n; i++, p += 4) {
+                      uint32_t m = head & 0x40000000 ? method : method + i * 4, v = R32(p);
+                      ApplyVisibilityMethod(m, v);
+                      if (m == kInlineArray) {
+                          if (prim) vertices.push_back(v);
+                      } else if (m == kArrayElem16) {
+                          if (prim) {
+                              indices.push_back(uint16_t(v & 0xFFFF));
+                              indices.push_back(uint16_t(v >> 16));
+                          }
+                      } else if (m == kArrayElem32) {
+                          if (prim) indices.push_back(uint16_t(v & 0xFFFF));
+                      } else if (m != kBeginEnd) {
+                          if (m >> 2 < g_state.simple.size()) g_state.simple[m >> 2] = v;
+                      } else if (v) {
+                          prim = v;
+                          vertices.clear();
+                          indices.clear();
+                      } else if (prim) {
+                          if (!indices.empty()) {
+                              SyncDeferred();
+                              if (g_backend) {
+                                  g_backend->Draw(g_state, prim, 0, uint32_t(indices.size()),
+                                                  reinterpret_cast<const uint8_t*>(indices.data()));
+                              }
+                          } else {
+                              uint32_t stride = VertexBytes(), bytes = uint32_t(vertices.size()) * 4;
+                              if (stride && bytes % stride == 0) DrawUp(prim, bytes / stride, vertices.data(), stride);
+                              else LOG_FIRST(8, "d3d: EndPush primitive %u dropped, %u bytes of vertices of %u", prim, bytes, stride);
+                          }
+                          prim = 0;
+                      }
+                  }
+              }
+              g_push_begin = 0;
+              ScratchPush();
+              return a[0];
+          }"""
+          assert old_endpush in s, "EndPush block not found"
+          s = s.replace(old_endpush, new_endpush, 1)
+
           extra_hooks = """
           #ifdef SYM_D3DDevice_GetProjectionViewportMatrix
           HLE_STDCALL(D3DDevice_GetProjectionViewportMatrix, 1) {
