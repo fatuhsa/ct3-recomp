@@ -7,7 +7,19 @@ Native Android (`arm64-v8a`) + Vulkan static recompilation port of **Crazy Taxi 
 
 This port lifts the Original Xbox `default.xbe` into 128 native C++ translation units using [`XboxXBERecomp`](https://github.com/TGP482/XboxXBERecomp) and runs them natively on Android ARM64 with a mobile-optimized Vulkan 1.1–1.3 renderer and ARM64 NEON render thread adapted from [**RanggaCasper**](https://github.com/RanggaCasper)'s Android static recompilation ports.
 
-> **Legal Notice:** This repository contains **no copyrighted game assets, ROMs, ISOs, or Xbox SDK binaries**. You must provide your own legally dumped USA Original Xbox copy of *Crazy Taxi 3: High Roller*. *Crazy Taxi 3: High Roller* is © SEGA / Hitmaker.
+> **Disclaimer & Anti-Piracy Notice (DWYOR):**
+> - **We do NOT support piracy.** Dump your own legally owned Original Xbox copy of *Crazy Taxi 3: High Roller* (`Crazy Taxi 3 - High Roller (USA).iso`).
+> - **No game code or copyrighted assets are published here.** This repository contains **zero** lifted/recompiled game C++ code (`generated/`), ROMs, ISOs, textures, audio, or Xbox SDK binaries — only the open-source Android/Vulkan host runtime, UI, and static recompiler configuration.
+> - **DWYOR (Do With Your Own Risk):** This is an independent, non-commercial research and preservation project provided strictly *as-is* without any warranty. *Crazy Taxi 3: High Roller* is © SEGA / Hitmaker.
+
+---
+
+## Tested Hardware & Compatibility
+
+| Device / GPU | Vulkan | Status | Notes |
+|---|---|---|---|
+| **ARM Mali-G57** (`0x13B5`, non-BC) | Vulkan 1.3 | **Tested / Playable** | Currently the **only** GPU tested on real hardware. Full 3D gameplay, 4-bone skinning, AAudio, touch controls & Settings Overlay verified. |
+| **Qualcomm Adreno / PowerVR / Xclipse / other Mali** | Vulkan 1.1–1.3 | **Untested** | Driver paths & workarounds are implemented, but not yet verified on physical hardware. Use the in-game **`SET`** overlay (`Vulkan API` / `Render Path`) if you encounter GPU quirks. |
 
 ---
 
