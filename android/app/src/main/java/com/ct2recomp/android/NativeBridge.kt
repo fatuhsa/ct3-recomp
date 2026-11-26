@@ -39,5 +39,18 @@ object NativeBridge {
         ultrawideHorPlus: Boolean,
         frameSkip60Hz: Boolean
     )
+    external fun nativeApplyRuntimeSettings(
+        renderScalePct: Int,
+        vkApiMode: Int,
+        renderPath: Int,
+        vsync: Boolean,
+        fpsCap: Int,
+        shadows: Boolean,
+        fog: Boolean,
+        bloom: Boolean,
+        screenFilter: Int,
+        antiAliasing: Int,
+        shaderPreload: Boolean
+    )
     external fun nativeShutdown()
 }

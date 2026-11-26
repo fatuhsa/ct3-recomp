@@ -1641,10 +1641,12 @@ bool VulkanBackend::CreateInstance() {
     std::vector<const char*> exts(sdl, sdl + n);
     uint32_t loader = VK_API_VERSION_1_1;
     vkEnumerateInstanceVersion(&loader);
+    const uint32_t api_mode = ct2::sdk_bridge::Config().vk_api_mode.load(std::memory_order_relaxed);
+    const uint32_t api_cap = api_mode == 2 ? VK_API_VERSION_1_1 : api_mode == 1 ? VK_API_VERSION_1_2 : VK_API_VERSION_1_3;
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     ai.pApplicationName = app::kGame.log;
     ai.pEngineName = "XboxXBE-Recomp";
-    ai.apiVersion = std::min<uint32_t>(loader, VK_API_VERSION_1_3);
+    ai.apiVersion = std::min<uint32_t>(loader, api_cap);
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &ai;
     ci.enabledExtensionCount = uint32_t(exts.size());
@@ -1715,14 +1717,20 @@ bool VulkanBackend::PickDevice() {
         vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr);
         std::vector<VkExtensionProperties> ext(en);
         vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, ext.data());
-        uint32_t api = std::min<uint32_t>(p.apiVersion, VK_API_VERSION_1_3);
+        const uint32_t api_mode = ct2::sdk_bridge::Config().vk_api_mode.load(std::memory_order_relaxed);
+        const uint32_t api_cap = api_mode == 2 ? VK_API_VERSION_1_1 : api_mode == 1 ? VK_API_VERSION_1_2 : VK_API_VERSION_1_3;
+        uint32_t api = std::min<uint32_t>(p.apiVersion, api_cap);
         bool swapchain = HasExtension(ext, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         bool dynamic = api >= VK_API_VERSION_1_3 || HasExtension(ext, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+        const uint32_t rpath = ct2::sdk_bridge::Config().render_path.load(std::memory_order_relaxed);
         // Adreno's vkCmdBeginRendering allocates on every call: a sixth of the render thread in the rain, where Most
         // Wanted's screen drops ping-pong between the frame and a 32x32 target 20 times a frame. Its render passes,
         // made once and cleared by their load ops, cost a quarter of that
         constexpr uint32_t kQualcomm = 0x5143;
-        if (dynamic && p.vendorID == kQualcomm) {
+        if (rpath == 2) {
+            dynamic = false;
+            LOGR("vulkan: user forced cached render passes");
+        } else if (rpath == 0 && dynamic && p.vendorID == kQualcomm) {
             dynamic = false;
             LOGR("vulkan: Adreno, render passes over dynamic rendering");
         }
@@ -4387,6 +4395,7 @@ bool VulkanBackend::AcquireImage(uint32_t& index) {
     }
     int w, h;
     host::WindowPixels(w, h);
+    app::Get().vsync = ct2::sdk_bridge::Config().vsync.load(std::memory_order_relaxed);
     if (!swap_ || swap_stale_ || uint32_t(w) != swap_extent_.width || uint32_t(h) != swap_extent_.height ||
         app::Get().vsync != vsync_) {
         if (!CreateSwapchain()) return false;

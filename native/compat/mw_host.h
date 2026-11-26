@@ -32,8 +32,15 @@ struct Options {
 };
 
 inline const Options& Opt() {
-    static const Options kOptions{};
-    return kOptions;
+    thread_local Options opts{};
+    const auto& cfg = ct2::sdk_bridge::Config();
+    opts.bloom = cfg.bloom.load(std::memory_order_relaxed);
+    opts.shadows = cfg.shadows.load(std::memory_order_relaxed);
+    opts.fog = cfg.fog.load(std::memory_order_relaxed);
+    opts.screen_filter = cfg.screen_filter.load(std::memory_order_relaxed);
+    opts.anti_aliasing = cfg.anti_aliasing.load(std::memory_order_relaxed);
+    opts.shader_preload = cfg.shader_preload.load(std::memory_order_relaxed);
+    return opts;
 }
 
 // The Android window is 2030x900 on the target device; use its real aspect

@@ -332,16 +332,22 @@ jobs:
               std::this_thread::sleep_for(std::chrono::milliseconds(16));
               return 0;
           }"""
-          new_vblank = """bool g_swapped_since_vblank = false;
+          new_vblank = """thread_local bool g_tl_swapped_since_vblank = false;
           HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
-              bool skip = false;
-              {
-                  std::lock_guard<std::recursive_mutex> lock(g_lock);
-                  skip = g_swapped_since_vblank;
-                  g_swapped_since_vblank = false;
+              if (g_tl_swapped_since_vblank) {
+                  g_tl_swapped_since_vblank = false;
+                  return 0;
               }
-              if (skip) return 0;
-              app::Pace();
+              using Clock = std::chrono::steady_clock;
+              static thread_local auto next_vb = Clock::now();
+              constexpr auto step = std::chrono::microseconds(16667);
+              auto now = Clock::now();
+              if (now < next_vb) {
+                  std::this_thread::sleep_until(next_vb);
+                  next_vb += step;
+              } else {
+                  next_vb = now + step;
+              }
               return 0;
           }"""
           assert old_vblank in s, "BlockUntilVerticalBlank block not found"
@@ -350,7 +356,7 @@ jobs:
           old_swap_pace = """    if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
               app::Pace();"""
           new_swap_pace = """    if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
-              g_swapped_since_vblank = true;
+              g_tl_swapped_since_vblank = true;
               app::Pace();"""
           assert old_swap_pace in s, "Swap Pace line not found"
           s = s.replace(old_swap_pace, new_swap_pace, 1)

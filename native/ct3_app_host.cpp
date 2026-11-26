@@ -31,6 +31,7 @@ namespace ct2::sdk_bridge {
 
 namespace {
 LiveBootMetrics g_metrics;
+RuntimeConfig g_config;
 std::atomic<ct2::vk::VulkanRenderer*> g_renderer{nullptr};
 
 std::mutex g_paths_mu;
@@ -52,6 +53,10 @@ GamepadState g_hw_pad{};
 
 LiveBootMetrics& Metrics() {
     return g_metrics;
+}
+
+RuntimeConfig& Config() {
+    return g_config;
 }
 
 void SetGpuDeviceName(const std::string& name) {
@@ -273,8 +278,8 @@ Mode Output() { return Desktop(); }
 
 float RenderScale(uint32_t guest_height) {
     if (guest_height == 0) return 1.0f;
-    // Native 1.0x (640x480) on Mali-G57 keeps GPU fillrate and thermal headroom maximally light
-    return 1.0f;
+    const uint32_t pct = ct2::sdk_bridge::Config().render_scale_pct.load(std::memory_order_relaxed);
+    return std::clamp(static_cast<float>(pct) / 100.0f, 0.5f, 2.0f);
 }
 
 bool Widescreen() {
@@ -305,16 +310,18 @@ std::recursive_mutex& UiLock() { return g_ui_lock; }
 
 void Pace() {
     using Clock = std::chrono::steady_clock;
-    static auto next_frame = Clock::now();
-    const uint32_t cap = g_settings.fps_cap;
+    static thread_local auto next_frame = Clock::now();
+    const uint32_t cap = ct2::sdk_bridge::Config().fps_cap.load(std::memory_order_relaxed);
     if (cap == 0) return;
     const auto step = std::chrono::microseconds(1000000 / (cap <= 1 ? 60 : cap));
     const auto now = Clock::now();
     if (now < next_frame) {
         std::this_thread::sleep_until(next_frame);
         next_frame += step;
-    } else {
+    } else if (now - next_frame > step * 2) {
         next_frame = now + step;
+    } else {
+        next_frame += step;
     }
 }
 

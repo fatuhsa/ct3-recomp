@@ -398,6 +398,33 @@ Java_com_ct2recomp_android_NativeBridge_nativeSetGraphicsSwitches(
 }
 
 JNIEXPORT void JNICALL
+Java_com_ct2recomp_android_NativeBridge_nativeApplyRuntimeSettings(
+    JNIEnv*, jclass,
+    jint render_scale_pct, jint vk_api_mode, jint render_path,
+    jboolean vsync, jint fps_cap,
+    jboolean shadows, jboolean fog, jboolean bloom,
+    jint screen_filter, jint anti_aliasing, jboolean shader_preload) {
+    auto& cfg = ct2::sdk_bridge::Config();
+    cfg.render_scale_pct.store(static_cast<uint32_t>(std::clamp(int(render_scale_pct), 50, 200)),
+                               std::memory_order_relaxed);
+    cfg.vk_api_mode.store(static_cast<uint32_t>(std::clamp(int(vk_api_mode), 0, 2)),
+                          std::memory_order_relaxed);
+    cfg.render_path.store(static_cast<uint32_t>(std::clamp(int(render_path), 0, 2)),
+                          std::memory_order_relaxed);
+    cfg.vsync.store(vsync == JNI_TRUE, std::memory_order_relaxed);
+    cfg.fps_cap.store(static_cast<uint32_t>(std::clamp(int(fps_cap), 0, 120)),
+                      std::memory_order_relaxed);
+    cfg.shadows.store(shadows == JNI_TRUE, std::memory_order_relaxed);
+    cfg.fog.store(fog == JNI_TRUE, std::memory_order_relaxed);
+    cfg.bloom.store(bloom == JNI_TRUE, std::memory_order_relaxed);
+    cfg.screen_filter.store(static_cast<uint32_t>(std::clamp(int(screen_filter), 0, 5)),
+                            std::memory_order_relaxed);
+    cfg.anti_aliasing.store(static_cast<uint32_t>(anti_aliasing == 2 ? 2 : 0),
+                            std::memory_order_relaxed);
+    cfg.shader_preload.store(shader_preload == JNI_TRUE, std::memory_order_relaxed);
+}
+
+JNIEXPORT void JNICALL
 Java_com_ct2recomp_android_NativeBridge_nativeShutdown(JNIEnv*, jclass) {
     g_rt.running.store(false, std::memory_order_release);
     if (g_rt.title_thread.joinable()) g_rt.title_thread.join();

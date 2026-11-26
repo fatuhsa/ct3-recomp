@@ -27,6 +27,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
@@ -36,6 +37,7 @@ import kotlin.math.roundToInt
 class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     companion object {
         private const val TAG = "CT2MainActivity"
+        private const val PREFS_NAME = "ct3_settings"
 
         // Xbox XINPUT_GAMEPAD button bits
         private const val BTN_DPAD_UP = 0x0001
@@ -50,10 +52,28 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
     private var hudText: TextView? = null
     private var romOverlay: LinearLayout? = null
     private var touchOverlay: FrameLayout? = null
+    private var touchLeftCluster: View? = null
+    private var touchRightCluster: View? = null
+    private var settingsOverlay: FrameLayout? = null
     private var statusText: TextView? = null
     private var romLoaded = false
     private var surfaceReady = false
     private var hudVisible = true
+
+    // Persisted runtime & graphics settings (live-applied where supported)
+    private var cfgRenderScalePct = 100  // 50, 75, 100, 125, 150, 200
+    private var cfgVkApiMode = 0         // 0=Auto(1.3), 1=1.2, 2=1.1
+    private var cfgRenderPath = 0        // 0=Auto, 1=DynRender, 2=CachedRP
+    private var cfgVsync = true
+    private var cfgFpsCap = 60           // 60, 0(Unl), 30
+    private var cfgShadows = true
+    private var cfgFog = true
+    private var cfgBloom = true
+    private var cfgScreenFilter = 0      // 0=Off, 1=Sharpen, 2=Vivid, 3=Scanlines, 4=CRT, 5=HDR
+    private var cfgAntiAliasing = 0      // 0=Off, 2=FXAA
+    private var cfgShaderPreload = true
+    private var cfgShowTouch = true
+    private var cfgTouchOpacityPct = 78  // 100, 78, 50, 25
 
     // Touch controller state
     private var touchButtons = 0
@@ -131,7 +151,9 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
 
         val filesDir = (getExternalFilesDir(null) ?: filesDir).absolutePath
         val cacheDir = (externalCacheDir ?: cacheDir).absolutePath
+        loadSettings()
         NativeBridge.nativeInit(filesDir, cacheDir)
+        pushSettingsToNative()
 
         val root = FrameLayout(this)
         surfaceView = SurfaceView(this).apply {
@@ -173,6 +195,20 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         val overlay = buildRomOverlay()
         romOverlay = overlay
         root.addView(overlay)
+
+        val settingsPanel = buildSettingsOverlay()
+        settingsOverlay = settingsPanel
+        settingsPanel.visibility = View.GONE
+        root.addView(
+            settingsPanel,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        applyTouchSettingsUi()
+        hudText?.visibility = if (hudVisible) View.VISIBLE else View.GONE
+
         setContentView(root)
 
         ContextCompat.registerReceiver(
@@ -265,6 +301,27 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             }
         }
         topBar.addView(hudBtn)
+        val setBtn = TextView(this).apply {
+            text = "SET"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(12).toFloat()
+                setColor(0x772266AA)
+                setStroke(dp(1), 0xAAFFFFFF.toInt())
+            }
+            layoutParams = LinearLayout.LayoutParams(dp(58), dp(38)).apply {
+                setMargins(dp(5), dp(5), dp(5), dp(5))
+            }
+            setOnClickListener {
+                val panel = settingsOverlay ?: return@setOnClickListener
+                panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+            }
+        }
+        topBar.addView(setBtn)
         layer.addView(
             topBar,
             FrameLayout.LayoutParams(
@@ -301,6 +358,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         })
         leftCluster.addView(upRow)
         leftCluster.addView(steerRow)
+        touchLeftCluster = leftCluster
         layer.addView(
             leftCluster,
             FrameLayout.LayoutParams(
@@ -351,6 +409,7 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         rightCluster.addView(abxyMid)
         rightCluster.addView(abxyBot)
         rightCluster.addView(pedals)
+        touchRightCluster = rightCluster
         layer.addView(
             rightCluster,
             FrameLayout.LayoutParams(
@@ -531,7 +590,258 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
         romLoaded = true
         romOverlay?.visibility = View.GONE
         touchOverlay?.visibility = View.VISIBLE
+        applyTouchSettingsUi()
         Log.i(TAG, "ROM mounted: $label")
+    }
+
+    private fun loadSettings() {
+        val sp = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        cfgRenderScalePct = sp.getInt("render_scale_pct", 100)
+        cfgVkApiMode = sp.getInt("vk_api_mode", 0)
+        cfgRenderPath = sp.getInt("render_path", 0)
+        cfgVsync = sp.getBoolean("vsync", true)
+        cfgFpsCap = sp.getInt("fps_cap", 60)
+        cfgShadows = sp.getBoolean("shadows", true)
+        cfgFog = sp.getBoolean("fog", true)
+        cfgBloom = sp.getBoolean("bloom", true)
+        cfgScreenFilter = sp.getInt("screen_filter", 0)
+        cfgAntiAliasing = sp.getInt("anti_aliasing", 0)
+        cfgShaderPreload = sp.getBoolean("shader_preload", true)
+        cfgShowTouch = sp.getBoolean("show_touch", true)
+        cfgTouchOpacityPct = sp.getInt("touch_opacity_pct", 78)
+        hudVisible = sp.getBoolean("hud_visible", true)
+    }
+
+    private fun saveSettings() {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putInt("render_scale_pct", cfgRenderScalePct)
+            .putInt("vk_api_mode", cfgVkApiMode)
+            .putInt("render_path", cfgRenderPath)
+            .putBoolean("vsync", cfgVsync)
+            .putInt("fps_cap", cfgFpsCap)
+            .putBoolean("shadows", cfgShadows)
+            .putBoolean("fog", cfgFog)
+            .putBoolean("bloom", cfgBloom)
+            .putInt("screen_filter", cfgScreenFilter)
+            .putInt("anti_aliasing", cfgAntiAliasing)
+            .putBoolean("shader_preload", cfgShaderPreload)
+            .putBoolean("show_touch", cfgShowTouch)
+            .putInt("touch_opacity_pct", cfgTouchOpacityPct)
+            .putBoolean("hud_visible", hudVisible)
+            .apply()
+    }
+
+    private fun pushSettingsToNative() {
+        NativeBridge.nativeApplyRuntimeSettings(
+            cfgRenderScalePct,
+            cfgVkApiMode,
+            cfgRenderPath,
+            cfgVsync,
+            cfgFpsCap,
+            cfgShadows,
+            cfgFog,
+            cfgBloom,
+            cfgScreenFilter,
+            cfgAntiAliasing,
+            cfgShaderPreload
+        )
+    }
+
+    private fun applyTouchSettingsUi() {
+        val vis = if (cfgShowTouch) View.VISIBLE else View.GONE
+        val alpha = (cfgTouchOpacityPct / 100f).coerceIn(0.15f, 1.0f)
+        touchLeftCluster?.visibility = vis
+        touchRightCluster?.visibility = vis
+        touchLeftCluster?.alpha = alpha
+        touchRightCluster?.alpha = alpha
+    }
+
+    private fun buildSettingsOverlay(): FrameLayout {
+        val backdrop = FrameLayout(this).apply {
+            setBackgroundColor(0xAA000000.toInt())
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { visibility = View.GONE }
+        }
+
+        val cardBg = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = dp(16).toFloat()
+            setColor(0xEE141A24.toInt())
+            setStroke(dp(1), 0x8866AACC.toInt())
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardBg
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            isClickable = true
+        }
+
+        // Header
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val title = TextView(this).apply {
+            text = "Crazy Taxi 3 Settings"
+            textSize = 17f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFFFFFFF.toInt())
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        val closeBtn = TextView(this).apply {
+            text = "CLOSE"
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(10).toFloat()
+                setColor(0xAA993333.toInt())
+            }
+            setPadding(dp(14), dp(7), dp(14), dp(7))
+            setOnClickListener { backdrop.visibility = View.GONE }
+        }
+        header.addView(title)
+        header.addView(closeBtn)
+        card.addView(header)
+
+        val subtitle = TextView(this).apply {
+            text = "Opsi bertanda (restart) berlaku saat app dibuka ulang."
+            textSize = 11f
+            setTextColor(0xFF9FB4CC.toInt())
+            setPadding(0, dp(4), 0, dp(10))
+        }
+        card.addView(subtitle)
+
+        val list = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        fun addSettingRow(label: String, valueText: () -> String, onCycle: () -> Unit) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(5), 0, dp(5))
+            }
+            val lbl = TextView(this).apply {
+                text = label
+                textSize = 13.5f
+                setTextColor(0xFFE6EEF8.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            val valBtn = TextView(this).apply {
+                text = valueText()
+                textSize = 12.5f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(0xFFFFFFFF.toInt())
+                gravity = Gravity.CENTER
+                minWidth = dp(140)
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(10).toFloat()
+                    setColor(0xFF23384E.toInt())
+                    setStroke(dp(1), 0x8888BBEE.toInt())
+                }
+                setOnClickListener {
+                    onCycle()
+                    text = valueText()
+                    saveSettings()
+                    pushSettingsToNative()
+                    applyTouchSettingsUi()
+                    hudText?.visibility = if (hudVisible) View.VISIBLE else View.GONE
+                }
+            }
+            row.addView(lbl)
+            row.addView(valBtn)
+            list.addView(row)
+        }
+
+        val resSteps = intArrayOf(50, 75, 100, 125, 150, 200)
+        addSettingRow("Internal Resolution", {
+            val w = (640 * cfgRenderScalePct) / 100
+            val h = (480 * cfgRenderScalePct) / 100
+            "${cfgRenderScalePct}% (${w}x${h})"
+        }) {
+            val idx = resSteps.indexOf(cfgRenderScalePct).let { if (it < 0) 2 else it }
+            cfgRenderScalePct = resSteps[(idx + 1) % resSteps.size]
+        }
+
+        addSettingRow("Vulkan API (restart)", {
+            when (cfgVkApiMode) {
+                1 -> "Vulkan 1.2"
+                2 -> "Vulkan 1.1"
+                else -> "Auto (1.3)"
+            }
+        }) { cfgVkApiMode = (cfgVkApiMode + 1) % 3 }
+
+        addSettingRow("Render Path (restart)", {
+            when (cfgRenderPath) {
+                1 -> "Dynamic Render"
+                2 -> "Cached RP"
+                else -> "Auto"
+            }
+        }) { cfgRenderPath = (cfgRenderPath + 1) % 3 }
+
+        addSettingRow("VSync (Swapchain)", { if (cfgVsync) "ON (FIFO)" else "OFF (Unlocked)" }) {
+            cfgVsync = !cfgVsync
+        }
+
+        val fpsSteps = intArrayOf(60, 0, 30)
+        addSettingRow("FPS Cap", { if (cfgFpsCap == 0) "Unlimited" else "$cfgFpsCap FPS" }) {
+            val idx = fpsSteps.indexOf(cfgFpsCap).let { if (it < 0) 0 else it }
+            cfgFpsCap = fpsSteps[(idx + 1) % fpsSteps.size]
+        }
+
+        addSettingRow("Shadows", { if (cfgShadows) "ON" else "OFF" }) { cfgShadows = !cfgShadows }
+        addSettingRow("Fog", { if (cfgFog) "ON" else "OFF" }) { cfgFog = !cfgFog }
+        addSettingRow("Bloom / Glow", { if (cfgBloom) "ON" else "OFF" }) { cfgBloom = !cfgBloom }
+
+        val filterNames = arrayOf("Off", "Sharpen", "Vivid", "Scanlines", "CRT", "HDR")
+        addSettingRow("Screen Filter", { filterNames[cfgScreenFilter.coerceIn(0, filterNames.lastIndex)] }) {
+            cfgScreenFilter = (cfgScreenFilter + 1) % filterNames.size
+        }
+
+        addSettingRow("Anti-Aliasing", { if (cfgAntiAliasing == 2) "FXAA" else "OFF" }) {
+            cfgAntiAliasing = if (cfgAntiAliasing == 2) 0 else 2
+        }
+
+        addSettingRow("Shader Preload", { if (cfgShaderPreload) "ON" else "OFF" }) {
+            cfgShaderPreload = !cfgShaderPreload
+        }
+
+        addSettingRow("Touch Controls", { if (cfgShowTouch) "SHOW" else "HIDE" }) {
+            cfgShowTouch = !cfgShowTouch
+        }
+
+        val opSteps = intArrayOf(100, 78, 50, 25)
+        addSettingRow("Touch Opacity", { "${cfgTouchOpacityPct}%" }) {
+            val idx = opSteps.indexOf(cfgTouchOpacityPct).let { if (it < 0) 1 else it }
+            cfgTouchOpacityPct = opSteps[(idx + 1) % opSteps.size]
+        }
+
+        addSettingRow("Performance HUD", { if (hudVisible) "ON" else "OFF" }) {
+            hudVisible = !hudVisible
+        }
+
+        val scroll = ScrollView(this).apply {
+            addView(list)
+        }
+        card.addView(
+            scroll,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        )
+
+        val dm = resources.displayMetrics
+        val cardW = (dm.widthPixels * 0.62f).roundToInt().coerceIn(dp(340), dp(520))
+        val cardH = (dm.heightPixels * 0.86f).roundToInt()
+        backdrop.addView(
+            card,
+            FrameLayout.LayoutParams(cardW, cardH, Gravity.CENTER)
+        )
+        return backdrop
     }
 
     override fun onResume() {

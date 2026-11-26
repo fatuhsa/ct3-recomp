@@ -58,7 +58,22 @@ struct GamepadState {
     int16_t ry = 0;
 };
 
+struct RuntimeConfig {
+    std::atomic<uint32_t> render_scale_pct{100};  // 50, 75, 100, 125, 150, 200
+    std::atomic<uint32_t> vk_api_mode{0};         // 0=Auto(1.3), 1=VK1.2, 2=VK1.1
+    std::atomic<uint32_t> render_path{0};         // 0=Auto, 1=DynamicRendering, 2=CachedRenderPass
+    std::atomic<bool> vsync{true};
+    std::atomic<uint32_t> fps_cap{60};            // 0=Unlimited, 30, 60
+    std::atomic<bool> shadows{true};
+    std::atomic<bool> fog{true};
+    std::atomic<bool> bloom{true};
+    std::atomic<uint32_t> screen_filter{0};       // 0=Off, 1=Sharpen, 2=Vivid, 3=Scanlines, 4=CRT, 5=HDR
+    std::atomic<uint32_t> anti_aliasing{0};       // 0=Off, 2=FXAA
+    std::atomic<bool> shader_preload{true};
+};
+
 LiveBootMetrics& Metrics();
+RuntimeConfig& Config();
 
 void SetGpuDeviceName(const std::string& name);
 std::string GetGpuDeviceName();
