@@ -72,8 +72,9 @@ jobs:
           perl -0777 -i -pe 's/file_ = open\(path\.c_str\(\), O_RDONLY\);/if (path.string().rfind("\/proc\/self\/fd\/", 0) == 0) { file_ = dup(std::stoi(path.string().substr(14))); } else { file_ = open(path.c_str(), O_RDONLY); }/' sdk/runtime/kernel/disc.cpp
           grep -n "proc/self/fd" sdk/runtime/kernel/disc.cpp
 
-          # 2. Patch sdk/runtime/xdk/d3d8.cpp for XDK 4531 D3DRS numbering (83 simple, 83..117 deferred, 118..146 complex)
-          #    and add HLE_STDCALL(D3DDevice_SetVertexShaderInput, 3) used by Crazy Taxi 3 mesh draws!
+          # 2. Patch sdk/runtime/xdk/d3d8.cpp for XDK 4531 D3DRS numbering (83 simple, 83..117 deferred, 118..146 complex),
+          #    default identity transforms, GetProjectionViewportMatrix ([CDevice+0x470]), SetModelView,
+          #    SetVertexBlendModelView, and SetVertexShaderInput used by Crazy Taxi 3 3D gameplay!
           python3 - << 'PY'
           from pathlib import Path
 
@@ -88,7 +89,36 @@ jobs:
           }"""
           old_sync = "\n".join(line[10:] if line.startswith("          ") else line for line in old_sync.splitlines())
 
-          new_sync = """void SyncDeferred() {
+          new_sync = """static void SetIdentity4x4(std::array<float, 16>& m) {
+              m = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+          }
+
+          // Recompute Xbox NV2A Projection * Viewport matrix into CDevice+0x470 for GetProjectionViewportMatrix
+          static void UpdateProjViewportMatrix() {
+              const auto& v = g_state.viewport;
+              const auto& pm = g_state.transforms[3];  // D3DTS_PROJECTION
+              const float hw = v.w * 0.5f;
+              const float hh = v.h * 0.5f;
+              const float ox = float(v.x) + g_state.ss_offset_x + hw;
+              const float oy = float(v.y) + g_state.ss_offset_y + hh;
+              const float zs = (v.max_z - v.min_z) * g_state.zscale;
+              const float zo = v.min_z * g_state.zscale;
+              float out[16];
+              for (int r = 0; r < 4; r++) {
+                  const float* pr = pm.data() + r * 4;
+                  out[r * 4 + 0] = pr[0] * hw + pr[3] * ox;
+                  out[r * 4 + 1] = pr[1] * (-hh) + pr[3] * oy;
+                  out[r * 4 + 2] = pr[2] * zs + pr[3] * zo;
+                  out[r * 4 + 3] = pr[3];
+              }
+              std::memcpy(HostPtr(kDevice + 0x470), out, 64);
+          }
+
+          static bool g_mv_override = false;
+          static std::array<float, 16> g_saved_world = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+          static std::array<float, 16> g_saved_view = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+          void SyncDeferred() {
               // XDK 4531 deferred render states: [83..114] -> kRsFogEnable..kRsPointSizeMax (+9), [117] -> kRsPresentationInterval
               for (uint32_t rs = 83; rs <= 114; rs++) g_state.rs[rs + 9] = R32(kRenderState + rs * 4);
               g_state.rs[gpu::kRsPresentationInterval] = R32(kRenderState + 117 * 4);
@@ -98,6 +128,45 @@ jobs:
           new_sync = "\n".join(line[10:] if line.startswith("          ") else line for line in new_sync.splitlines())
           assert old_sync in s, "SyncDeferred block not found"
           s = s.replace(old_sync, new_sync, 1)
+
+          old_vp_end = """        std::memcpy(HostPtr(p + 16), &v.min_z, 4);
+                  std::memcpy(HostPtr(p + 20), &v.max_z, 4);
+              }
+          }"""
+          old_vp_end = "\n".join(line[10:] if line.startswith("          ") else line for line in old_vp_end.splitlines())
+          new_vp_end = """        std::memcpy(HostPtr(p + 16), &v.min_z, 4);
+                  std::memcpy(HostPtr(p + 20), &v.max_z, 4);
+              }
+              UpdateProjViewportMatrix();
+          }"""
+          new_vp_end = "\n".join(line[10:] if line.startswith("          ") else line for line in new_vp_end.splitlines())
+          assert old_vp_end in s, "UpdateViewportConstants tail not found"
+          s = s.replace(old_vp_end, new_vp_end, 1)
+
+          old_init_state = """    g_state = gpu::State{};
+              g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+              SetDev(kDevRenderTarget, g_buffers[1]);
+              SetDev(kDevDepth, g_depth);
+              SetDev(kDevBackBuffer, g_buffers[1]);
+              SetDev(kDevFrontBuffer, g_buffers[1]);"""
+          old_init_state = "\n".join(line[10:] if line.startswith("          ") else line for line in old_init_state.splitlines())
+          new_init_state = """    g_state = gpu::State{};
+              SetIdentity4x4(g_state.transforms[2]);
+              SetIdentity4x4(g_state.transforms[3]);
+              SetIdentity4x4(g_state.transforms[256]);
+              for (int ti = 0; ti < 4; ti++) SetIdentity4x4(g_state.transforms[16 + ti]);
+              g_mv_override = false;
+              SetIdentity4x4(g_saved_world);
+              SetIdentity4x4(g_saved_view);
+              g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+              SetDev(kDevRenderTarget, g_buffers[1]);
+              SetDev(kDevDepth, g_depth);
+              SetDev(kDevBackBuffer, g_buffers[1]);
+              SetDev(kDevFrontBuffer, g_buffers[1]);
+              SetDev(kDevFrontBuffer + 4, g_buffers[0]);"""
+          new_init_state = "\n".join(line[10:] if line.startswith("          ") else line for line in new_init_state.splitlines())
+          assert old_init_state in s, "CreateDevice g_state init block not found"
+          s = s.replace(old_init_state, new_init_state, 1)
 
           old_complex = """void SetComplex(uint32_t rs, uint32_t v) {
               g_state.rs[rs] = v;
@@ -143,7 +212,89 @@ jobs:
           assert old_rs in s, "SetRenderStateNotInline block not found"
           s = s.replace(old_rs, new_rs, 1)
 
-          vs_input_hook = """
+          old_xform = """HLE_STDCALL(D3DDevice_SetTransform, 2) {
+              uint32_t t = a[0];
+              if (t >= 10) return 0;
+              std::memcpy(HostPtr(kDevice + kDevTransforms + t * 64), HostPtr(a[1]), 64);
+              uint32_t pc = t < 2 ? t + 2 : t < 6 ? t + 14 : t + 250;
+              std::memcpy(g_state.transforms[pc].data(), HostPtr(a[1]), 64);
+              return 0;
+          }"""
+          old_xform = "\n".join(line[10:] if line.startswith("          ") else line for line in old_xform.splitlines())
+          new_xform = """HLE_STDCALL(D3DDevice_SetTransform, 2) {
+              std::lock_guard<std::recursive_mutex> lock(g_lock);
+              uint32_t t = a[0];
+              if (t >= 10 || !a[1]) return 0;
+              std::memcpy(HostPtr(kDevice + kDevTransforms + t * 64), HostPtr(a[1]), 64);
+              uint32_t pc = t < 2 ? t + 2 : t < 6 ? t + 14 : t + 250;
+              std::memcpy(g_state.transforms[pc].data(), HostPtr(a[1]), 64);
+              if (pc == 256) g_saved_world = g_state.transforms[256];
+              if (pc == 2) g_saved_view = g_state.transforms[2];
+              if (pc == 3) UpdateProjViewportMatrix();
+              return 0;
+          }"""
+          new_xform = "\n".join(line[10:] if line.startswith("          ") else line for line in new_xform.splitlines())
+          assert old_xform in s, "SetTransform block not found"
+          s = s.replace(old_xform, new_xform, 1)
+
+          extra_hooks = """
+          #ifdef SYM_D3DDevice_GetProjectionViewportMatrix
+          HLE_STDCALL(D3DDevice_GetProjectionViewportMatrix, 1) {
+              std::lock_guard<std::recursive_mutex> lock(g_lock);
+              UpdateProjViewportMatrix();
+              if (a[0]) std::memcpy(HostPtr(a[0]), HostPtr(kDevice + 0x470), 64);
+              return 0;
+          }
+          #endif
+
+          #ifdef SYM_D3DDevice_SetModelView
+          HLE_STDCALL(D3DDevice_SetModelView, 3) {
+              std::lock_guard<std::recursive_mutex> lock(g_lock);
+              if (!a[0]) {
+                  if (g_mv_override) {
+                      g_state.transforms[256] = g_saved_world;
+                      g_state.transforms[2] = g_saved_view;
+                      g_mv_override = false;
+                  }
+                  return 0;
+              }
+              if (!g_mv_override) {
+                  g_saved_world = g_state.transforms[256];
+                  g_saved_view = g_state.transforms[2];
+                  g_mv_override = true;
+              }
+              std::memcpy(g_state.transforms[256].data(), HostPtr(a[0]), 64);
+              SetIdentity4x4(g_state.transforms[2]);
+              return 0;
+          }
+          #endif
+
+          #ifdef SYM_D3DDevice_SetVertexBlendModelView
+          HLE_STDCALL(D3DDevice_SetVertexBlendModelView, 4) {
+              std::lock_guard<std::recursive_mutex> lock(g_lock);
+              uint32_t count = a[0], mvs = a[1];
+              if (!count || !mvs) {
+                  if (g_mv_override) {
+                      g_state.transforms[256] = g_saved_world;
+                      g_state.transforms[2] = g_saved_view;
+                      g_mv_override = false;
+                  }
+                  return 0;
+              }
+              if (!g_mv_override) {
+                  g_saved_world = g_state.transforms[256];
+                  g_saved_view = g_state.transforms[2];
+                  g_mv_override = true;
+              }
+              uint32_t n = std::min<uint32_t>(count, 4u);
+              for (uint32_t i = 0; i < n; i++) {
+                  std::memcpy(g_state.transforms[256 + i].data(), HostPtr(mvs + i * 64), 64);
+              }
+              SetIdentity4x4(g_state.transforms[2]);
+              return 0;
+          }
+          #endif
+
           #ifdef SYM_D3DDevice_SetVertexShaderInput
           HLE_STDCALL(D3DDevice_SetVertexShaderInput, 3) {
               std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -164,7 +315,8 @@ jobs:
                   if (vb && offset) {
                       uint32_t& h = s_hdrs[i];
                       if (!h) h = mem::AllocSystem(20);
-                      std::memcpy(HostPtr(h), HostPtr(vb), 20);
+                      std::memset(HostPtr(h), 0, 20);
+                      std::memcpy(HostPtr(h), HostPtr(vb), 12);
                       W32(h + 4, R32(vb + 4) + offset);
                       g_state.streams[i] = {h, stride};
                   } else {
@@ -175,10 +327,10 @@ jobs:
           }
           #endif
           """
-          vs_input_hook = "\n".join(line[10:] if line.startswith("          ") else line for line in vs_input_hook.splitlines())
-          s += "\n" + vs_input_hook + "\n"
+          extra_hooks = "\n".join(line[10:] if line.startswith("          ") else line for line in extra_hooks.splitlines())
+          s += "\n" + extra_hooks + "\n"
           p.write_text(s)
-          print("Patched sdk/runtime/xdk/d3d8.cpp for XDK 4531 + SetVertexShaderInput.")
+          print("Patched sdk/runtime/xdk/d3d8.cpp for XDK 4531 + ModelView/ProjViewport/VertexShaderInput.")
           PY
 
           sudo apt-get update -qq
