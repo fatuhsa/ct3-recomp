@@ -930,18 +930,73 @@ constexpr uint64_t kPretransformedSalt = 0x5A5A;
 constexpr uint64_t kPointsSalt = 0x9017;
 constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
 
+uint32_t SkinMode(const State& s, const Assembled& a, const DrawShaders& sh) {
+    if (!sh.fixed_transform || !((a.regs >> 1) & 1)) return 0;
+    uint32_t vb = s.rs[kRsVertexBlend];
+    return (vb >= 1 && vb <= 6) ? vb : 0;
+}
+
 uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     uint64_t seed = sh.prog ? s.vs->hash ^ a.regs : Hash(&s.vs_handle, 4, a.regs | kDeclarationSalt);
     uint64_t vkey = Hash(&a.decode, 8, seed);
     if (!sh.prog && a.pretransformed) vkey ^= kPretransformedSalt;
     if (!sh.prog) vkey = Hash(&sh.fk, sizeof(sh.fk), vkey);
+    if (uint32_t vb = SkinMode(s, a, sh)) vkey = Hash(&vb, sizeof(vb), vkey ^ 0x534B494Eull);
     if (a.topology == Topology::Points) vkey ^= kPointsSalt;
     return vkey;
 }
 
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
     if (sh.prog) return VertexProgram(*s.vs, a.regs, a.decode);
-    return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
+    std::string hlsl = FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
+    uint32_t vb = SkinMode(s, a, sh);
+    if (!vb) return hlsl;
+    auto vreg = [&](int r, const char* def) {
+        return ((a.regs >> r) & 1) ? ("i.v" + std::to_string(r)) : std::string(def);
+    };
+    const std::string v0 = vreg(0, "float4(0,0,0,1)");
+    const std::string v2 = vreg(2, "float4(0,0,0,0)");
+    const std::string from =
+        "    float4 ip = float4(" + v0 + ".xyz, 1);\n"
+        "    float4 cp = mul(ip, wvp);\n"
+        "    float3 vp = mul(ip, wv).xyz;\n"
+        "    float3 vn = mul(float4(" + v2 + ".xyz, 0), wvn).xyz;\n";
+    // NV2A / Xbox D3DVERTEXBLENDFLAGS: 1=2G, 2=2, 3=3G, 4=3, 5=4G, 6=4
+    // b0 c[0..15] = wv[0..3] (row-major), c[16..31] = wvn[0..3], c[32..35] = proj*vpm
+    std::string rep;
+    rep += "    float4 ip = float4(" + v0 + ".xyz, 1);\n";
+    rep += "    float4 in_n = float4(" + v2 + ".xyz, 0);\n";
+    rep += "    float4 bw = i.v1;\n";
+    if (vb == 1) rep += "    float w0 = bw.x, w1 = 1.0 - w0;\n";
+    else if (vb == 2) rep += "    float w0 = bw.x, w1 = bw.y;\n";
+    else if (vb == 3) rep += "    float w0 = bw.x, w1 = bw.y, w2 = 1.0 - w0 - w1;\n";
+    else if (vb == 4) rep += "    float w0 = bw.x, w1 = bw.y, w2 = bw.z;\n";
+    else if (vb == 5) rep += "    float w0 = bw.x, w1 = bw.y, w2 = bw.z, w3 = 1.0 - w0 - w1 - w2;\n";
+    else rep += "    float w0 = bw.x, w1 = bw.y, w2 = bw.z, w3 = bw.w;\n";
+    rep += "    float4x4 m0 = float4x4(c[0], c[1], c[2], c[3]);\n";
+    rep += "    float4x4 m1 = float4x4(c[4], c[5], c[6], c[7]);\n";
+    rep += "    float4x4 n0 = float4x4(c[16], c[17], c[18], c[19]);\n";
+    rep += "    float4x4 n1 = float4x4(c[20], c[21], c[22], c[23]);\n";
+    if (vb >= 3) {
+        rep += "    float4x4 m2 = float4x4(c[8], c[9], c[10], c[11]);\n";
+        rep += "    float4x4 n2 = float4x4(c[24], c[25], c[26], c[27]);\n";
+    }
+    if (vb >= 5) {
+        rep += "    float4x4 m3 = float4x4(c[12], c[13], c[14], c[15]);\n";
+        rep += "    float4x4 n3 = float4x4(c[28], c[29], c[30], c[31]);\n";
+    }
+    rep += "    float4x4 pv = float4x4(c[32], c[33], c[34], c[35]);\n";
+    rep += "    float3 vp = mul(ip, m0).xyz * w0 + mul(ip, m1).xyz * w1";
+    if (vb >= 3) rep += " + mul(ip, m2).xyz * w2";
+    if (vb >= 5) rep += " + mul(ip, m3).xyz * w3";
+    rep += ";\n";
+    rep += "    float4 cp = mul(float4(vp, 1), pv);\n";
+    rep += "    float3 vn = mul(in_n, n0).xyz * w0 + mul(in_n, n1).xyz * w1";
+    if (vb >= 3) rep += " + mul(in_n, n2).xyz * w2";
+    if (vb >= 5) rep += " + mul(in_n, n3).xyz * w3";
+    rep += ";\n";
+    ReplaceOnce(hlsl, from, rep);
+    return hlsl;
 }
 
 void KeyBlend(const State& s, PsoKey& k) {
@@ -1226,7 +1281,6 @@ private:
         // tenth of the render thread. A view destroyed may have its handle reused, so a set made before is let go
         // (set_gen against view_gen_) and the pools are reset once the GPU is past them (pools_dirty)
         std::unordered_map<uint64_t, VkDescriptorSet> sets;
-        std::unordered_map<uint64_t, VkDeviceSize> vb_cache;  // per-frame static VB slice dedup
         uint64_t set_gen = 0;
         bool pools_dirty = false;
         VkSemaphore acquire = VK_NULL_HANDLE;
@@ -1395,33 +1449,18 @@ private:
     PFN_vkCmdEndRenderingKHR end_rendering_ = nullptr;
     PFN_vkWaitSemaphoresKHR wait_semaphores_ = nullptr;
     PFN_vkGetSemaphoreCounterValueKHR counter_value_ = nullptr;
-    PFN_vkCmdSetCullMode cmd_set_cull_mode_ = nullptr;
-    PFN_vkCmdSetFrontFace cmd_set_front_face_ = nullptr;
-    PFN_vkCmdSetDepthTestEnable cmd_set_depth_test_ = nullptr;
-    PFN_vkCmdSetDepthWriteEnable cmd_set_depth_write_ = nullptr;
-    PFN_vkCmdSetDepthCompareOp cmd_set_depth_cmp_ = nullptr;
-    PFN_vkCmdSetStencilTestEnable cmd_set_stencil_test_ = nullptr;
-    PFN_vkCmdSetStencilOp cmd_set_stencil_op_ = nullptr;
-    bool ext_dyn_state_ = false;  // Vulkan 1.3 core dynamic cull/depth/stencil to cut PSO compilations
     bool dynamic_ = true;  // dynamic rendering; Vulkan 1.1 drivers (older Adrenos) only have render passes
     bool timeline_ok_ = true;  // without it a fence per submit stands in for the timeline's values
-    uint32_t pipes_since_save_ = 0;
     // Per-command-buffer dynamic state cache to skip redundant vkCmd* calls across 1000+ draws/frame
     VkPipeline cb_pipe_ = VK_NULL_HANDLE;
     bool cb_vp_valid_ = false, cb_sc_valid_ = false, cb_blend_valid_ = false, cb_sref_valid_ = false;
-    bool cb_ext_valid_ = false;
     float cb_vp_[4] = {};
     int32_t cb_sc_[4] = {};
     uint32_t cb_blend_color_ = 0;
     uint32_t cb_sref_ = 0;
-    VkCullModeFlags cb_cull_ = VK_CULL_MODE_NONE;
-    VkFrontFace cb_ff_ = VK_FRONT_FACE_CLOCKWISE;
-    VkBool32 cb_zen_ = VK_FALSE, cb_zw_ = VK_FALSE, cb_sten_ = VK_FALSE;
-    VkCompareOp cb_zop_ = VK_COMPARE_OP_ALWAYS, cb_sfunc_ = VK_COMPARE_OP_ALWAYS;
-    VkStencilOp cb_sfail_ = VK_STENCIL_OP_KEEP, cb_spass_ = VK_STENCIL_OP_KEEP, cb_szfail_ = VK_STENCIL_OP_KEEP;
     void ResetCbState() {
         cb_pipe_ = VK_NULL_HANDLE;
-        cb_vp_valid_ = cb_sc_valid_ = cb_blend_valid_ = cb_sref_valid_ = cb_ext_valid_ = false;
+        cb_vp_valid_ = cb_sc_valid_ = cb_blend_valid_ = cb_sref_valid_ = false;
     }
     std::atomic<bool> gpu_failed_{false};
     struct Pending {
@@ -1775,18 +1814,6 @@ bool VulkanBackend::CreateDevice() {
     if ((dynamic_ && (!begin_rendering_ || !end_rendering_)) || (timeline_ok_ && (!wait_semaphores_ || !counter_value_))) {
         LOGE("vulkan: device functions missing");
         return false;
-    }
-    if (core13) {
-        cmd_set_cull_mode_ = reinterpret_cast<PFN_vkCmdSetCullMode>(vkGetDeviceProcAddr(dev_, "vkCmdSetCullMode"));
-        cmd_set_front_face_ = reinterpret_cast<PFN_vkCmdSetFrontFace>(vkGetDeviceProcAddr(dev_, "vkCmdSetFrontFace"));
-        cmd_set_depth_test_ = reinterpret_cast<PFN_vkCmdSetDepthTestEnable>(vkGetDeviceProcAddr(dev_, "vkCmdSetDepthTestEnable"));
-        cmd_set_depth_write_ = reinterpret_cast<PFN_vkCmdSetDepthWriteEnable>(vkGetDeviceProcAddr(dev_, "vkCmdSetDepthWriteEnable"));
-        cmd_set_depth_cmp_ = reinterpret_cast<PFN_vkCmdSetDepthCompareOp>(vkGetDeviceProcAddr(dev_, "vkCmdSetDepthCompareOp"));
-        cmd_set_stencil_test_ = reinterpret_cast<PFN_vkCmdSetStencilTestEnable>(vkGetDeviceProcAddr(dev_, "vkCmdSetStencilTestEnable"));
-        cmd_set_stencil_op_ = reinterpret_cast<PFN_vkCmdSetStencilOp>(vkGetDeviceProcAddr(dev_, "vkCmdSetStencilOp"));
-        ext_dyn_state_ = cmd_set_cull_mode_ && cmd_set_front_face_ && cmd_set_depth_test_ &&
-                         cmd_set_depth_write_ && cmd_set_depth_cmp_ && cmd_set_stencil_test_ && cmd_set_stencil_op_;
-        if (ext_dyn_state_) LOGR("vulkan: Vulkan 1.3 extended dynamic state enabled (reduced PSO stutter)");
     }
     // the depth buffer: 24 bit with stencil as on the console where the GPU has it
     auto usable = [&](VkFormat f) {
@@ -2366,7 +2393,6 @@ bool VulkanBackend::ResetFrame(Frame& f) {
         f.set_gen = view_gen_;
         f.pools_dirty = false;
     }
-    f.vb_cache.clear();
     f.used = 0;
     upload_epoch_++;
     return true;
@@ -2835,7 +2861,7 @@ VkPipeline VulkanBackend::FullScreenPipeline(const char* hlsl, const char* ps_en
 
 // shadercache/preload.bin: its header, then records, each a tag and what it lists
 constexpr uint32_t kListMagic = 0x4C50574D;  // "MWPL"
-constexpr uint32_t kListVersion = 2;
+constexpr uint32_t kListVersion = 1;
 constexpr uint32_t kListShader = 1, kListPipeline = 2;  // a record's tag: a shader's key and hash, a PsoKey
 
 VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k, VkShaderModule vs, VkShaderModule ps) {
@@ -2852,7 +2878,6 @@ VkPipeline VulkanBackend::EnsurePipeline(const PsoKey& k, VkShaderModule vs, VkS
     g_perf.pipe_ns += SinceNs(t);
     g_perf.pipes++;
     pipelines_[h] = pipe;
-    if (pipe) pipes_since_save_++;
     if (pipe && listed_.insert(h).second) Record(kListPipeline, &k, sizeof(k));
     return pipe;
 }
@@ -2926,21 +2951,10 @@ VkPipeline VulkanBackend::BuildPipeline(const PsoKey& k, VkShaderModule vs, VkSh
     VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     cb.attachmentCount = k.has_rt ? 1 : 0;
     cb.pAttachments = &ba;
-    VkDynamicState dyn[11] = {
-        VK_DYNAMIC_STATE_VIEWPORT,
-        VK_DYNAMIC_STATE_SCISSOR,
-        VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-        VK_DYNAMIC_STATE_CULL_MODE,
-        VK_DYNAMIC_STATE_FRONT_FACE,
-        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
-        VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
-        VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-        VK_DYNAMIC_STATE_STENCIL_OP,
-    };
+    VkDynamicState dyn[4] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                             VK_DYNAMIC_STATE_STENCIL_REFERENCE};
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dy.dynamicStateCount = ext_dyn_state_ ? 11u : 4u;
+    dy.dynamicStateCount = 4;
     dy.pDynamicStates = dyn;
     VkFormat color = VkFormat(k.rtfmt);
     VkPipelineRenderingCreateInfoKHR rinfo{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
@@ -3853,18 +3867,6 @@ void VulkanBackend::BuildPipelineKey(const State& s, const Assembled& a, const D
     KeyBlend(s, k);
     if (k.has_ds) KeyDepthStencil(s, a, k);
     KeyRasterizer(s, a, k);
-    if (ext_dyn_state_) {
-        k.cull = 0;
-        k.ccw = 0;
-        k.zen = 0;
-        k.zwrite = 0;
-        k.zfunc = 0;
-        k.sten = 0;
-        k.sfunc = 0;
-        k.sfail = 0;
-        k.szfail = 0;
-        k.spass = 0;
-    }
 }
 
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
@@ -3973,55 +3975,57 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         FillLightConstants(s, sh.fk, c);
     }
     std::memcpy(c.vattr, s.vattr.data(), sizeof(c.vattr));
-    // the vertex constants as the last draw's: its copy in this frame's ring serves
+    // the vertex constants as the last draw's: its copy in this frame's ring serves;
+    // skinned fixed-function draws pack 4 row-major WV + 4 WVN + Proj*VP into unused b0 c[0..35]
     const Frame* cf = &CurrentFrame();
     Alloc vc;
-    bool same_vsc = g_vsc_counted ? last_vsc_changes_ == g_vsc_changes
-                                  : !std::memcmp(s.vsc.data(), last_vsc_.data(), sizeof(s.vsc));
-    if (last_vc_frame_ == cf && last_vc_epoch_ == upload_epoch_ && same_vsc) {
-        vc = last_vc_;
-    } else {
-        vc = Constants(s.vsc.data(), sizeof(s.vsc));
+    const uint32_t skin_mode = SkinMode(s, a, sh);
+    if (skin_mode) {
+        float skin_c[36 * 4] = {};
+        const uint32_t nbones = skin_mode >= 5 ? 4u : skin_mode >= 3 ? 3u : 2u;
+        const float* vm = s.transforms[kTsView].data();
+        for (uint32_t bi = 0; bi < nbones; bi++) {
+            float wv_b[16], wvn_b[16] = {};
+            MatMul(s.transforms[kTsWorld + bi].data(), vm, wv_b);
+            InverseTranspose3x3(wv_b, wvn_b);
+            std::memcpy(skin_c + bi * 16, wv_b, sizeof(wv_b));
+            std::memcpy(skin_c + (16 + bi * 4) * 4, wvn_b, sizeof(wvn_b));
+        }
+        const auto& v = s.viewport;
+        float sx = float(v.w) / size.w, sy = float(v.h) / size.h;
+        float ox = (2.0f * v.x + v.w) / size.w - 1, oy = 1 - (2.0f * v.y + v.h) / size.h;
+        float vpm[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, v.max_z - v.min_z, 0, ox, oy, v.min_z, 1};
+        float pv[16];
+        MatMul(s.transforms[kTsProjection].data(), vpm, pv);
+        std::memcpy(skin_c + 32 * 4, pv, sizeof(pv));
+        vc = Constants(skin_c, sizeof(skin_c));
         if (!vc.cpu) return;
-        if (g_vsc_counted) last_vsc_changes_ = g_vsc_changes;
-        else std::memcpy(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
-        last_vc_ = vc;
-        last_vc_frame_ = &CurrentFrame();
-        last_vc_epoch_ = upload_epoch_;
+    } else {
+        bool same_vsc = g_vsc_counted ? last_vsc_changes_ == g_vsc_changes
+                                      : !std::memcmp(s.vsc.data(), last_vsc_.data(), sizeof(s.vsc));
+        if (last_vc_frame_ == cf && last_vc_epoch_ == upload_epoch_ && same_vsc) {
+            vc = last_vc_;
+        } else {
+            vc = Constants(s.vsc.data(), sizeof(s.vsc));
+            if (!vc.cpu) return;
+            if (g_vsc_counted) last_vsc_changes_ = g_vsc_changes;
+            else std::memcpy(last_vsc_.data(), s.vsc.data(), sizeof(s.vsc));
+            last_vc_ = vc;
+            last_vc_frame_ = &CurrentFrame();
+            last_vc_epoch_ = upload_epoch_;
+        }
     }
     Alloc dc = Constants(&c, sizeof(c));
     if (!dc.cpu) return;
     VkBuffer vbufs[16];
     VkDeviceSize voffs[16];
-    Frame& cur_f = CurrentFrame();
-    const uint8_t* asm_vbase = a.vertices.empty() ? nullptr : reinterpret_cast<const uint8_t*>(a.vertices.data());
-    const uint8_t* asm_vend = asm_vbase ? asm_vbase + a.vertices.size() * sizeof(float) : nullptr;
     for (uint32_t i = 0; i < a.buffer_count; i++) {
         const VertexBuffer& b = a.buffers[i];
-        bool cacheable = b.src && b.bytes >= 128 && b.bytes <= kUploadSize / 4 &&
-                         !(asm_vbase && b.src >= asm_vbase && b.src < asm_vend) &&
-                         (a.gathered[i].empty() || b.src != a.gathered[i].data());
-        uint64_t vb_key = 0;
-        if (cacheable) {
-            uint64_t head = 0, tail = 0;
-            std::memcpy(&head, b.src, 8);
-            std::memcpy(&tail, b.src + b.bytes - 8, 8);
-            uint64_t kdata[4] = {uint64_t(reinterpret_cast<uintptr_t>(b.src)), uint64_t(b.bytes), head, tail};
-            vb_key = Hash(kdata, sizeof(kdata));
-            if (auto it = cur_f.vb_cache.find(vb_key); it != cur_f.vb_cache.end()) {
-                vbufs[i] = cur_f.upload.buf;
-                voffs[i] = it->second;
-                continue;
-            }
-        }
         Alloc v = Upload(std::max<uint32_t>(b.bytes, 4), 16);
         if (!v.cpu) return;
         if (b.src && b.bytes) std::memcpy(v.cpu, b.src, b.bytes);
         vbufs[i] = v.buf;
         voffs[i] = v.off;
-        if (cacheable && v.buf == CurrentFrame().upload.buf) {
-            CurrentFrame().vb_cache[vb_key] = v.off;
-        }
     }
     Alloc ib{};
     if (a.index_count) {
@@ -4079,31 +4083,6 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, sref);
         cb_sref_valid_ = true;
         cb_sref_ = sref;
-    }
-    if (ext_dyn_state_) {
-        constexpr uint32_t kCullCw = 0x900;
-        uint32_t cull_rs = s.rs[kRsCullMode];
-        VkCullModeFlags cull_m = (cull_rs != 0 && a.topology == Topology::Triangles) ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
-        VkFrontFace ff = (cull_rs == kCullCw) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-        VkBool32 zen = (draw_ds_ && s.rs[kRsZEnable] != 0) ? VK_TRUE : VK_FALSE;
-        VkBool32 zw = (zen && SimpleState(s, kMZWriteEnable) != 0) ? VK_TRUE : VK_FALSE;
-        VkCompareOp zop = zen ? Cmp(SimpleState(s, kMZFunc)) : VK_COMPARE_OP_ALWAYS;
-        VkBool32 sten = (draw_ds_ && s.rs[kRsStencilEnable] != 0) ? VK_TRUE : VK_FALSE;
-        VkStencilOp sfail = sten ? StencilOp(s.rs[kRsStencilFail]) : VK_STENCIL_OP_KEEP;
-        VkStencilOp spass = sten ? StencilOp(SimpleState(s, kMStencilPass)) : VK_STENCIL_OP_KEEP;
-        VkStencilOp szfail = sten ? StencilOp(SimpleState(s, kMStencilZFail)) : VK_STENCIL_OP_KEEP;
-        VkCompareOp sfunc = sten ? Cmp(SimpleState(s, kMStencilFunc)) : VK_COMPARE_OP_ALWAYS;
-        if (!cb_ext_valid_ || cull_m != cb_cull_) { cmd_set_cull_mode_(cb, cull_m); cb_cull_ = cull_m; }
-        if (!cb_ext_valid_ || ff != cb_ff_) { cmd_set_front_face_(cb, ff); cb_ff_ = ff; }
-        if (!cb_ext_valid_ || zen != cb_zen_) { cmd_set_depth_test_(cb, zen); cb_zen_ = zen; }
-        if (!cb_ext_valid_ || zw != cb_zw_) { cmd_set_depth_write_(cb, zw); cb_zw_ = zw; }
-        if (!cb_ext_valid_ || zop != cb_zop_) { cmd_set_depth_cmp_(cb, zop); cb_zop_ = zop; }
-        if (!cb_ext_valid_ || sten != cb_sten_) { cmd_set_stencil_test_(cb, sten); cb_sten_ = sten; }
-        if (!cb_ext_valid_ || sfail != cb_sfail_ || spass != cb_spass_ || szfail != cb_szfail_ || sfunc != cb_sfunc_) {
-            cmd_set_stencil_op_(cb, VK_STENCIL_FACE_FRONT_AND_BACK, sfail, spass, szfail, sfunc);
-            cb_sfail_ = sfail; cb_spass_ = spass; cb_szfail_ = szfail; cb_sfunc_ = sfunc;
-        }
-        cb_ext_valid_ = true;
     }
     if (a.buffer_count) vkCmdBindVertexBuffers(cb, 0, a.buffer_count, vbufs, voffs);
     if (a.index_count) {
@@ -4768,10 +4747,7 @@ void VulkanBackend::Present(const Surface& front) {
     metrics.fps.store(fps_, std::memory_order_release);
     metrics.gpu_load_pct.store(std::max(0.0f, g_gpu_load.load(std::memory_order_relaxed)),
                                std::memory_order_release);
-    if (pipes_since_save_ >= 32 || (presents_ % 600 == 0 && pipes_since_save_ > 0)) {
-        SavePipelineCache();
-        pipes_since_save_ = 0;
-    }
+    if (presents_ % 600 == 0) SavePipelineCache();
     if (!preload_started_ && game::Opt().shader_preload) StartPreload();
     ApplySettings();
 }

@@ -184,14 +184,7 @@ HLE_STDCALL(IDirectSoundBuffer_SetDistanceFactor, 3) { return 0; }
 namespace {
 
 std::recursive_mutex g_ui_lock;
-app::Settings g_settings = [] {
-    app::Settings s{};
-    // Android SurfaceFlinger composites tear-free; disabling hard FIFO VSync lets Vulkan
-    // select VK_PRESENT_MODE_MAILBOX_KHR so 16.8 ms frames never drop to the 30 FPS VSync cliff.
-    s.vsync = false;
-    s.fps_cap = 60;
-    return s;
-}();
+app::Settings g_settings{};
 std::atomic<bool> g_audio_started{false};
 std::thread g_audio_thread;
 
@@ -281,10 +274,10 @@ Mode Output() { return Desktop(); }
 float RenderScale(uint32_t guest_height) {
     const Mode m = Output();
     if (guest_height == 0) return 1.0f;
-    // Cap internal render scale cleanly on Mali-G57 non-BC so 60 FPS holds effortlessly
+    // Cap internal render scale cleanly on Mali-G57 non-BC (1.25x = 800x600) for crisp 60 FPS
     const float raw = (static_cast<float>(m.height) * (static_cast<float>(g_settings.render_percent) / 100.0f)) /
                       static_cast<float>(guest_height);
-    return std::clamp(raw, 1.0f, 1.5f);
+    return std::clamp(raw, 1.0f, 1.25f);
 }
 
 bool Widescreen() {
@@ -318,18 +311,13 @@ void Pace() {
     static auto next_frame = Clock::now();
     const uint32_t cap = g_settings.fps_cap;
     if (cap == 0) return;
-    const auto step = std::chrono::nanoseconds(1'000'000'000ll / (cap <= 1 ? 60 : cap));
-    auto now = Clock::now();
+    const auto step = std::chrono::microseconds(1000000 / (cap <= 1 ? 60 : cap));
+    const auto now = Clock::now();
     if (now < next_frame) {
-        // Sleep bulk minus 1 ms to avoid Android kernel timer overshoot, then yield tail.
-        const auto wake = next_frame - std::chrono::milliseconds(1);
-        if (now < wake) std::this_thread::sleep_until(wake);
-        while ((now = Clock::now()) < next_frame) std::this_thread::yield();
+        std::this_thread::sleep_until(next_frame);
         next_frame += step;
-    } else if (now - next_frame > step * 2) {
-        next_frame = now + step;
     } else {
-        next_frame += step;
+        next_frame = now + step;
     }
 }
 

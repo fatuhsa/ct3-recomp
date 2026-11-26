@@ -318,12 +318,12 @@ class MainActivity : ComponentActivity(), SurfaceHolder.Callback {
             gravity = Gravity.END
         }
         val abxyTop = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        abxyTop.addView(makePadButton("X (HOP)", 0x66225588, 72, 46) { down -> touchX = if (down) 255 else 0 })
-        abxyTop.addView(makePadButton("Y", 0x66887711, 58, 46) { down -> touchY = if (down) 255 else 0 })
+        abxyTop.addView(makePadButton("X", 0x66554422, 62, 46) { down -> touchX = if (down) 255 else 0 })
+        abxyTop.addView(makePadButton("Y (HOP)", 0x66225588, 72, 46) { down -> touchY = if (down) 255 else 0 })
 
         val abxyBot = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        abxyBot.addView(makePadButton("B (REV)", 0x66882222, 72, 50) { down -> touchB = if (down) 255 else 0 })
-        abxyBot.addView(makePadButton("A (DRV)", 0x66227733, 72, 50) { down -> touchA = if (down) 255 else 0 })
+        abxyBot.addView(makePadButton("A (REV)", 0x66882222, 74, 50) { down -> touchA = if (down) 255 else 0 })
+        abxyBot.addView(makePadButton("B (DRV)", 0x66227733, 74, 50) { down -> touchB = if (down) 255 else 0 })
 
         val pedals = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         pedals.addView(makePadButton("BRAKE", 0x77992222, 82, 64) { down -> touchLt = if (down) 255 else 0 })
